@@ -2770,7 +2770,10 @@ INDEX_HTML = r"""<!doctype html>
 
         <div class="form-group" style="margin-bottom: 16px;">
           <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理出站端口</label>
-          <div class="form-group" style="margin-bottom: 12px; margin-top: 16px;">
+          <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" placeholder="7928">
+        </div>
+
+        <div class="form-group" style="margin-bottom: 12px; margin-top: 16px;">
           <label class="form-label" for="net_proxy_user">SOCKS5 代理账号 (留空则不验证)</label>
           <input type="text" id="net_proxy_user" class="input-field" placeholder="请输入代理连接账号">
         </div>
@@ -2778,8 +2781,6 @@ INDEX_HTML = r"""<!doctype html>
         <div class="form-group" style="margin-bottom: 16px;">
           <label class="form-label" for="net_proxy_pass">SOCKS5 代理密码 (留空则不验证)</label>
           <input type="text" id="net_proxy_pass" class="input-field" placeholder="请输入代理连接密码">
-        </div>
-          <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" placeholder="7928">
         </div>
 
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
