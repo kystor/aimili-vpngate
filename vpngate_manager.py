@@ -3108,18 +3108,32 @@ function getLatencyClass(ms) {
   return 'latency-poor';
 }
 
+function getCountryCountMap() {
+  const countMap = {};
+  nodes.forEach(n => {
+    if (n && n.country) {
+      countMap[n.country] = (countMap[n.country] || 0) + 1;
+    }
+  });
+  return countMap;
+}
+
 function updateCountryFilter() {
   const select = $("country_filter");
   const selectedValue = select.value;
-  const countries = Array.from(new Set(nodes.map(n => n.country).filter(Boolean))).sort();
+  const countMap = getCountryCountMap();
+  const countries = Object.keys(countMap).sort();
   
   const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
-  if (JSON.stringify(countries) === JSON.stringify(currentOptions)) {
+  const currentTexts = Array.from(select.options).filter(o => o.value).map(o => o.textContent || "");
+  const nextTexts = countries.map(c => `${c} (${countMap[c]})`);
+  if (JSON.stringify(countries) === JSON.stringify(currentOptions) &&
+      JSON.stringify(nextTexts) === JSON.stringify(currentTexts)) {
     return;
   }
   
   select.innerHTML = '<option value="">所有国家</option>' + 
-    countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+    countries.map(c => `<option value="${esc(c)}">${esc(c)} (${countMap[c]})</option>`).join("");
   
   if (countries.includes(selectedValue)) {
     select.value = selectedValue;
@@ -3610,13 +3624,19 @@ function updateHeaderRoutingControls() {
   if (!selectCountry || !selectIpType) return;
   
   // 1. Countries list
-  const countries = Array.from(new Set(nodes.map(n => n.country).filter(Boolean))).sort();
+  const countMap = getCountryCountMap();
+  const countries = Object.keys(countMap).sort();
   const currentOptions = Array.from(selectCountry.options).map(o => o.value).filter(v => v && v !== "fixed_ip_mode");
+  const currentTexts = Array.from(selectCountry.options)
+    .filter(o => o.value && o.value !== "fixed_ip_mode")
+    .map(o => o.textContent || "");
+  const nextTexts = countries.map(c => `${c} (${countMap[c]}个节点)`);
   
-  const rebuild = JSON.stringify(countries) !== JSON.stringify(currentOptions);
+  const rebuild = JSON.stringify(countries) !== JSON.stringify(currentOptions) ||
+    JSON.stringify(nextTexts) !== JSON.stringify(currentTexts);
   if (rebuild) {
     selectCountry.innerHTML = '<option value="">智能路由 / 所有</option>' + 
-      countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+      countries.map(c => `<option value="${esc(c)}">${esc(c)} (${countMap[c]}个节点)</option>`).join("");
   }
   
   // 2. Set value
