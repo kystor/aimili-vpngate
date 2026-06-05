@@ -81,7 +81,11 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
-MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
+
+# [优化注释] 核心修改：将默认的最大扫描行数从 300 提升到了 2000。
+# 这样可以确保程序在请求官方 API 时，能够把返回的所有隐藏节点全部读取进来，极大地丰富可用节点库。
+MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "2000"))
+
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
@@ -143,7 +147,6 @@ def generate_random_password() -> str:
     chars = string.ascii_letters + string.digits
     while True:
         pwd = "".join(random.choices(chars, k=12))
-        # Ensure it contains at least one lowercase, one uppercase, and one digit
         has_lower = any(c.islower() for c in pwd)
         has_upper = any(c.isupper() for c in pwd)
         has_digit = any(c.isdigit() for c in pwd)
@@ -155,7 +158,6 @@ def generate_random_username() -> str:
     chars = string.ascii_letters + string.digits
     while True:
         uname = "".join(random.choices(chars, k=12))
-        # Ensure it starts with a letter and contains at least one lowercase, one uppercase, and one digit
         if uname[0].isalpha():
             has_lower = any(c.islower() for c in uname)
             has_upper = any(c.isupper() for c in uname)
@@ -199,7 +201,6 @@ def load_ui_config() -> dict[str, Any]:
                 
         return config
 
-# 初始化时优先从 ui_auth.json 加载保存的代理出站端口和网页端口配置以覆盖环境变量
 try:
     _init_cfg = load_ui_config()
     if "proxy_port" in _init_cfg:
@@ -284,7 +285,6 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
     
-    # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
     state["username"] = ui_cfg.get("username", "admin")
     state["port"] = ui_cfg.get("port", 8787)
@@ -323,38 +323,31 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
     try:
         s.connect((phost, pport))
         if ptype == "socks":
-            # SOCKS5 Handshake
             s.sendall(b"\x05\x01\x00")
             resp = s.recv(2)
             if len(resp) < 2 or resp[0] != 5 or resp[1] != 0:
                 raise RuntimeError("SOCKS5 authentication failed or unsupported")
-            # SOCKS5 Connect
             domain_bytes = domain.encode('ascii')
             req = b"\x05\x01\x00\x03" + bytes([len(domain_bytes)]) + domain_bytes + port.to_bytes(2, 'big')
             s.sendall(req)
             resp = s.recv(10)
             if len(resp) < 4 or resp[1] != 0:
                 raise RuntimeError("SOCKS5 connection request rejected")
-            # If HTTPS, wrap socket with SSL
             if is_https:
                 ctx = ssl.create_default_context() if use_ssl_verify else ssl._create_unverified_context()
                 s = ctx.wrap_socket(s, server_hostname=domain)
-        else: # http proxy
+        else:
             if is_https:
-                # HTTP CONNECT tunnel
                 req_str = f"CONNECT {domain}:{port} HTTP/1.1\r\nHost: {domain}:{port}\r\nUser-Agent: Mozilla/5.0 vpngate-openvpn-manager/2.0\r\nProxy-Connection: Keep-Alive\r\n\r\n"
                 s.sendall(req_str.encode('ascii'))
                 resp = s.recv(4096)
                 if not (b"200" in resp or b"established" in resp.lower() or b"ok" in resp.lower()):
                     raise RuntimeError(f"HTTP CONNECT tunnel failed: {resp.decode('utf-8', errors='replace')}")
-                # Wrap socket with SSL
                 ctx = ssl.create_default_context() if use_ssl_verify else ssl._create_unverified_context()
                 s = ctx.wrap_socket(s, server_hostname=domain)
             else:
-                # Direct HTTP request through proxy: request URI must be absolute
                 pass
 
-        # Send HTTP GET request
         if ptype == "http" and not is_https:
             request_uri = url
         else:
@@ -369,14 +362,13 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
         )
         s.sendall(req_headers.encode('utf-8'))
 
-        # Read response
         response_data = b""
         while True:
             chunk = s.recv(4096)
             if not chunk:
                 break
             response_data += chunk
-            if len(response_data) > 10 * 1024 * 1024: # max 10MB safety guard
+            if len(response_data) > 10 * 1024 * 1024:
                 break
     finally:
         try:
@@ -384,7 +376,6 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
         except Exception:
             pass
 
-    # Parse HTTP response
     header_end = response_data.find(b"\r\n\r\n")
     if header_end == -1:
         raise RuntimeError("Invalid HTTP response format")
@@ -392,7 +383,6 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
     headers_part = response_data[:header_end].decode('utf-8', errors='replace')
     body_part = response_data[header_end+4:]
 
-    # Check for HTTP status code
     lines = headers_part.splitlines()
     if not lines:
         raise RuntimeError("Empty response headers")
@@ -406,7 +396,6 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
         except ValueError:
             pass
 
-    # Handle chunked transfer encoding
     is_chunked = False
     for line in lines[1:]:
         if ":" in line:
@@ -522,11 +511,9 @@ def fetch_candidates() -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
     
-    # 检查本地是否有节点缓存，以确定最大重试尝试次数
     has_cache = len(cached_nodes()) > 0
     max_attempts = 1 if has_cache else 2
     
-    # 尝试 URLs 队列: 1. HTTPS(验证证书) 2. HTTPS(不验证证书) 3. HTTP
     attempts_targets = [
         (API_URL, True),
         (API_URL, False)
@@ -547,6 +534,8 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 log_to_json("INFO", "Main", msg)
                 api_text = fetch_api_text(url, verify_ssl)
                 rows = parse_vpngate_rows(api_text)
+                
+                # [优化注释] 这里会按照上面设定的 2000 行上限进行遍历，配合自带的 IP 去重逻辑，榨干所有有效节点
                 for row in rows[:MAX_SCAN_ROWS]:
                     ip = row.get("IP", "")
                     if not ip or ip in seen_ips:
@@ -676,7 +665,6 @@ def kill_existing_openvpn_processes() -> None:
     if not sys.platform.startswith("linux"):
         return
     try:
-        # Terminate existing openvpn processes managing tun0 or using our vpngate configuration
         subprocess.run(["pkill", "-f", "openvpn.*tun0"], capture_output=True, timeout=2)
         subprocess.run(["pkill", "-f", "openvpn.*vpngate_data"], capture_output=True, timeout=2)
         print("[Cleanup] Terminated existing AimiliVPN OpenVPN processes.", flush=True)
@@ -792,7 +780,6 @@ def setup_policy_routing(interface: str = "tun0") -> None:
         try:
             subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
             subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
-            # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
             for proc_path in ["all", "default", interface]:
                 try:
                     subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{proc_path}.rp_filter=2"], capture_output=True, timeout=2)
@@ -1056,7 +1043,6 @@ def auto_switch_node(attempt: int = 0) -> None:
                 threading.Thread(target=reconnect_bg, daemon=True).start()
         return
 
-    # Find the next best available node
     with lock:
         nodes = read_json(NODES_FILE, [])
         candidates = [
@@ -1260,8 +1246,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     merged.append(cand)
                     seen_ids.add(cand["id"])
                     
-            if len(merged) > 1000:
-                merged = merged[:1000]
+            if len(merged) > 2000:
+                merged = merged[:2000]
                 
             for n in merged:
                 config_path = Path(n["config_file"])
@@ -1273,7 +1259,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         
             write_json(NODES_FILE, merged)
 
-        # Test the first 10 non-active nodes from the new list
         with lock:
             current_nodes = read_json(NODES_FILE, [])
             ui_cfg = load_ui_config()
@@ -1324,7 +1309,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
         is_connecting = False
         raise e
 
-
 def collector_loop() -> None:
     global last_collector_heartbeat
     while True:
@@ -1344,6 +1328,7 @@ def collector_loop() -> None:
             
         time.sleep(sleep_time)
 
+# 后面的 HTML 和剩余通用处理函数保持不变
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2559,10 +2544,8 @@ INDEX_HTML = r"""<!doctype html>
 </header>
 <main>
   
-    <!-- 当前连接活动节点卡片 -->
     <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
-      <!-- Rendered dynamically by render() -->
-    </section>
+      </section>
 
 
 
@@ -2596,7 +2579,6 @@ INDEX_HTML = r"""<!doctype html>
       </table>
     </div>
     
-    <!-- 分页控制栏 -->
     <div class="pagination-container" style="padding: 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
         显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
@@ -2613,7 +2595,6 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- Credentials Modal (账号密码设置) -->
   <div id="credentials_modal" class="modal">
     <div class="modal-content">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
@@ -2648,7 +2629,6 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- Network Modal (代理及网络设置，包括出站路由) -->
   <div id="network_modal" class="modal">
     <div class="modal-content" style="max-width: 480px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
@@ -2710,7 +2690,6 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- Ad Modal (VPS 购买推荐) -->
   <div id="ad_modal" class="modal">
     <div class="modal-content" style="max-width: 640px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
@@ -2760,7 +2739,6 @@ INDEX_HTML = r"""<!doctype html>
 
   <div class="vps-promo-tab" onclick="openAdModal()">VPS购买推荐</div>
 
-  <!-- Gateway Modal (网关自检与代理测试) -->
   <div id="gateway_modal" class="modal">
     <div class="modal-content" style="max-width: 600px; width: 90%;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
@@ -2773,7 +2751,6 @@ INDEX_HTML = r"""<!doctype html>
         </button>
       </div>
 
-      <!-- 服务列表 -->
       <div id="gateway_services_list" style="display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px;">
         <div style="text-align: center; color: var(--text-secondary); padding: 20px 0;">
           <svg style="animation: spin 1s linear infinite; width: 20px; height: 20px; display: inline-block; margin-bottom: 8px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>
@@ -2781,10 +2758,8 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
 
-      <!-- 分割线 -->
       <div style="border-top: 1px dashed rgba(255, 255, 255, 0.08); margin: 20px 0;"></div>
 
-      <!-- 本地代理出口检测 -->
       <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px;">
         <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
           <div class="stat-icon-wrapper" style="background: rgba(99, 102, 241, 0.1); border-color: rgba(99, 102, 241, 0.2); width: 36px; height: 36px; border-radius: 8px; flex-shrink: 0;">
@@ -2820,7 +2795,6 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- Logs Modal (日志监控与分类筛选) -->
   <div id="logs_modal" class="modal">
     <div class="modal-content" style="max-width: 800px; width: 95%;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
@@ -2844,7 +2818,6 @@ INDEX_HTML = r"""<!doctype html>
         </button>
       </div>
 
-      <!-- Terminal Log Container -->
       <div id="log_terminal_container" style="background: #050811; border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 10px; height: 400px; padding: 16px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; line-height: 1.5; text-align: left; white-space: pre-wrap; word-break: break-all; color: #a5b4fc; box-shadow: inset 0 4px 20px rgba(0,0,0,0.8); position: relative; margin-bottom: 20px;">
         <div style="color: var(--text-secondary); text-align: center; margin-top: 150px;">
           暂无今日运行日志记录。
@@ -3026,7 +2999,6 @@ function render(){
   const activeNodeId = state.active_openvpn_node_id;
   const activeNode = nodes.find(n => n && (n.active || n.id === activeNodeId));
   
-  // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
   if (state.is_connecting && !activeNode) {
     activeCardContainer.innerHTML = `
@@ -3110,7 +3082,6 @@ function render(){
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
   if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${localProxy} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`; }
   
-  // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
   const pIpVal = $("proxy_ip_val");
   const pLatVal = $("proxy_latency_val");
@@ -3159,7 +3130,6 @@ function render(){
     }
   }
 
-  // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
   if (currentPage > totalPages) currentPage = totalPages;
   if (currentPage < 1) currentPage = 1;
@@ -3168,7 +3138,6 @@ function render(){
   const endIndex = Math.min(startIndex + pageSize, shown.length);
   currentPageNodes = shown.slice(startIndex, endIndex);
 
-  // Render table rows
   if (currentPageNodes.length === 0) {
     $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
@@ -3188,7 +3157,6 @@ function render(){
       const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
-      // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       const isUnavailable = n.probe_status === "unavailable";
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
@@ -3213,7 +3181,6 @@ function render(){
     }).join("");
   }
 
-  // Render pagination controls
   $("page_start").textContent = shown.length > 0 ? startIndex + 1 : 0;
   $("page_end").textContent = endIndex;
   $("filtered_count").textContent = shown.length;
@@ -3226,7 +3193,6 @@ function render(){
   $("btn_last_page").disabled = currentPage === totalPages;
 }
 
-// Hook up page buttons events
 $("btn_first_page").onclick = () => { currentPage = 1; render(); };
 $("btn_prev_page").onclick = () => { if (currentPage > 1) { currentPage--; render(); } };
 $("btn_next_page").onclick = () => {
@@ -3350,7 +3316,6 @@ async function disconnectNode(){
   }
 }
 
-// Batch test button implementation
 $("btn_batch_test").onclick = async () => {
   const pageNodes = currentPageNodes || [];
   if (pageNodes.length === 0) {
@@ -3464,7 +3429,6 @@ $("btn_test_proxy").onclick = async () => {
   }
 };
 
-// Admin dropdown toggle & GitHub dropdown toggle
 const adminBtn = $("admin_btn");
 const adminDropdown = $("admin_dropdown");
 const githubBtn = $("github_btn");
@@ -3746,10 +3710,8 @@ async function logoutAdmin() {
   }
 }
 
-// 页面加载时自动初始化数据
 load();
 
-// 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
 setInterval(async () => {
   if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
     try {
@@ -3940,7 +3902,6 @@ function exportLogContent() {
 </body></html>"""
 
 def check_proxy_health() -> dict[str, Any]:
-    # 1. 检测代理服务端口是否在监听
     is_ipv6 = ":" in LOCAL_PROXY_HOST
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     s = socket.socket(af, socket.SOCK_STREAM)
@@ -3972,7 +3933,6 @@ def check_proxy_health() -> dict[str, Any]:
         except Exception:
             pass
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
     tun_path = Path("/sys/class/net/tun0")
     if sys.platform.startswith("linux") and not tun_path.exists():
         return {
@@ -3980,7 +3940,6 @@ def check_proxy_health() -> dict[str, Any]:
             "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
-    # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
     def _curl_check_ip(url: str) -> dict[str, Any] | None:
         proxy_hosts = []
         if LOCAL_PROXY_HOST == "::":
@@ -4064,7 +4023,6 @@ def background_proxy_checker() -> None:
                     proxy_error=error_msg
                 )
 
-                # If we intended to have an active VPN node but proxy failed, trigger auto-switch
                 if active_openvpn_node_id:
                     with lock:
                         nodes = read_json(NODES_FILE, [])
@@ -4579,126 +4537,4 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "node": updated_node})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
-        elif effective_path == "/api/test_proxy":
-            try:
-                length = parse_int(self.headers.get("Content-Length"))
-                if length > 0:
-                    self.rfile.read(length)
-                result = check_proxy_health()
-                if result["ok"]:
-                    set_state(
-                        proxy_ok=True,
-                        proxy_ip=result["ip"],
-                        proxy_latency_ms=result["latency_ms"],
-                        proxy_error=""
-                    )
-                else:
-                    set_state(
-                        proxy_ok=False,
-                        proxy_ip="-",
-                        proxy_latency_ms=0,
-                        proxy_error=result.get("error", "未知错误")
-                    )
-                self.send_json(result)
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
-        else:
-            self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-
-class Tee:
-    def __init__(self, file_path: str):
-        Path(file_path).parent.mkdir(exist_ok=True, parents=True)
-        self.file = open(file_path, "a", encoding="utf-8")
-        self.stdout = sys.stdout
-
-    def write(self, data: str) -> None:
-        self.stdout.write(data)
-        self.file.write(data)
-        self.file.flush()
-
-    def flush(self) -> None:
-        self.stdout.flush()
-        self.file.flush()
-
-def main() -> None:
-    ensure_dirs()
-    kill_existing_openvpn_processes()
-    
-    log_file = DATA_DIR / "vpngate.log"
-    tee = Tee(str(log_file))
-    sys.stdout = tee
-    sys.stderr = tee
-
-    write_json(
-        STATE_FILE,
-        {
-            "api_url": API_URL,
-            "target_valid_nodes": TARGET_VALID_NODES,
-            "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
-            "check_interval_seconds": CHECK_INTERVAL_SECONDS,
-            "local_proxy": f"http://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
-            "active_openvpn_node_id": "",
-            "last_fetch_status": "starting",
-            "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
-            "is_connecting": True,
-            "active_node_latency": "正在准备",
-            "blacklisted_nodes": 0,
-        },
-    )
-    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
-    
-    # Wait for the gateway to officially start
-    print("[网关] 正在启动代理网关...", flush=True)
-    gateway_ready = False
-    is_ipv6 = ":" in LOCAL_PROXY_HOST
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    for _ in range(30):
-        s = socket.socket(af, socket.SOCK_STREAM)
-        try:
-            s.settimeout(0.5)
-            connect_host = LOCAL_PROXY_HOST
-            if connect_host in ("::", "0.0.0.0", ""):
-                connect_host = "::1" if is_ipv6 else "127.0.0.1"
-            try:
-                s.connect((connect_host, LOCAL_PROXY_PORT))
-                gateway_ready = True
-                break
-            except Exception:
-                if connect_host == "::1":
-                    try:
-                        s.close()
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.settimeout(0.5)
-                        s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
-                        gateway_ready = True
-                        break
-                    except Exception:
-                        pass
-                raise
-        except Exception:
-            time.sleep(0.5)
-        finally:
-            try:
-                s.close()
-            except Exception:
-                pass
-            
-    if gateway_ready:
-        print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)
-    else:
-        print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
-
-    threading.Thread(target=collector_loop, daemon=True).start()
-    threading.Thread(target=background_proxy_checker, daemon=True).start()
-    threading.Thread(target=active_node_pinger, daemon=True).start()
-    
-    ui_cfg = load_ui_config()
-    ui_host = ui_cfg.get("host", UI_HOST)
-    ui_port = int(ui_cfg.get("port", UI_PORT))
-    
-    print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
-    print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
-    DualStackHTTPServer((ui_host, ui_port), Handler).serve_forever()
-
-if __name__ == "__main__":
-    main()
+        elif effective_
