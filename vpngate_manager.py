@@ -1040,9 +1040,9 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    # 【优化】将最大并发测速线程数从 30 提升到 60
+    # 【优化】将最大并发测速线程数从 30 提升到 50
     # 这样能大幅缩短海量节点的批量连通性检测时间，但又不会因为线程过多导致系统崩溃
-    max_workers = min(60, max(1, len(to_test)))
+    max_workers = min(50, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
@@ -2646,11 +2646,40 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
+  <main>
   
-    <!-- 当前连接活动节点卡片 -->
-    <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
-      <!-- Rendered dynamically by render() -->
+    <section class="stats">
+      <div class="stat">
+        <div class="stat-info">
+          <strong id="total">0</strong>
+          <span>全网备选节点总数</span>
+        </div>
+        <div class="stat-icon-wrapper">
+          <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-info">
+          <strong id="target">3</strong>
+          <span>目标优选节点数</span>
+        </div>
+        <div class="stat-icon-wrapper" style="background: rgba(245, 158, 11, 0.1); border-color: rgba(245, 158, 11, 0.2);">
+          <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="color: var(--warning);"><path stroke-linecap="round" stroke-linejoin="round" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg>
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-info">
+          <strong id="active">0</strong>
+          <span>当前活动连接数</span>
+        </div>
+        <div class="stat-icon-wrapper" style="background: rgba(16, 185, 129, 0.1); border-color: rgba(16, 185, 129, 0.2);">
+          <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="color: var(--success);"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+        </div>
+      </div>
     </section>
+
+    <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
+      </section>
 
 
 
@@ -2667,6 +2696,10 @@ INDEX_HTML = r"""<!doctype html>
     <button id="btn_batch_test" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--primary-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
       批量测试本页
+    </button>
+    <button id="btn_batch_test_all" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--success-gradient); margin-left: 12px;">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
+      批量测试全部
     </button>
   </section>
   <div class="table-wrapper">
@@ -2690,7 +2723,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     
     <!-- 分页控制栏 -->
-    <div class="pagination-container" style="padding: 16px; display: none; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
+    <div class="pagination-container" style="padding: 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
         显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
       </div>
@@ -3506,6 +3539,69 @@ $("btn_batch_test").onclick = async () => {
     btn.disabled = false;
     btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> 批量测试本页`;
   }
+};
+
+// ==========================================
+// 新增：批量测试所有获取到节点的实现逻辑
+// ==========================================
+$("btn_batch_test_all").onclick = async () => {
+  // 1. 获取本地存储的所有备选节点
+  const allNodes = nodes || [];
+  if (allNodes.length === 0) {
+    alert("当前没有获取到任何备选节点，请先等待列表加载。");
+    return;
+  }
+  
+  const btn = $("btn_batch_test_all");
+  btn.disabled = true; // 防止用户重复点击
+  const originalHtml = btn.innerHTML; // 保存原本按钮的文字和图标
+  
+  // 按钮切换为动态的加载中状态
+  btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width: 14px; height: 14px; display: inline-block; margin-right: 6px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>全部测试中...`;
+
+  // 2. 将所有节点在界面上先标记为“检测中”
+  allNodes.forEach(n => testingNodeIds.add(n.id));
+  render();
+
+  // 提取出所有节点的 ID，准备发送给后台
+  const allIds = allNodes.map(n => n.id);
+  
+  // 3. 核心分批逻辑：为了防止一次性测试几千个节点导致请求超时，我们每次向后端发送 50 个节点进行测试
+  const chunkSize = 50;
+
+  for (let i = 0; i < allIds.length; i += chunkSize) {
+    const chunkIds = allIds.slice(i, i + chunkSize);
+    try {
+      // 调用后端的批量测试 API (/api/test_nodes)
+      const response = await fetch("./api/test_nodes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: chunkIds })
+      });
+      const result = await response.json();
+
+      // 如果这 50 个节点测试完成了，就在前端更新它们的数据
+      if (result.ok && result.nodes) {
+        result.nodes.forEach(updatedNode => {
+          // 找到当前列表中对应的节点并覆盖其状态和延迟
+          const idx = nodes.findIndex(item => item.id === updatedNode.id);
+          if (idx !== -1) {
+            nodes[idx] = updatedNode; 
+          }
+        });
+      }
+    } catch (e) {
+      console.error("批量测试请求失败:", e);
+    } finally {
+      // 无论这批成功还是失败，都将它们从转圈的“检测中”状态移除
+      chunkIds.forEach(id => testingNodeIds.delete(id));
+      render(); // 刷新一下界面，让用户能看到一部分节点已经测试完毕变色了
+    }
+  }
+
+  // 4. 全部循环执行完毕，恢复按钮为可点击状态
+  btn.disabled = false;
+  btn.innerHTML = originalHtml;
 };
 
 function updateHeaderRoutingControls() {
