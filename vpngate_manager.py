@@ -301,6 +301,8 @@ def get_state() -> dict[str, Any]:
     state["port"] = ui_cfg.get("port", 8787)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
+    state["proxy_user"] = ui_cfg.get("proxy_user", "") # 新增这一行
+    state["proxy_pass"] = ui_cfg.get("proxy_pass", "") # 新增这一行
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
@@ -2768,6 +2770,15 @@ INDEX_HTML = r"""<!doctype html>
 
         <div class="form-group" style="margin-bottom: 16px;">
           <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理出站端口</label>
+          <div class="form-group" style="margin-bottom: 12px; margin-top: 16px;">
+          <label class="form-label" for="net_proxy_user">SOCKS5 代理账号 (留空则不验证)</label>
+          <input type="text" id="net_proxy_user" class="input-field" placeholder="请输入代理连接账号">
+        </div>
+
+        <div class="form-group" style="margin-bottom: 16px;">
+          <label class="form-label" for="net_proxy_pass">SOCKS5 代理密码 (留空则不验证)</label>
+          <input type="text" id="net_proxy_pass" class="input-field" placeholder="请输入代理连接密码">
+        </div>
           <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" placeholder="7928">
         </div>
 
@@ -3802,6 +3813,8 @@ function openNetworkModal() {
     $("net_port").value = state.port || 8787;
     $("net_suffix").value = state.secret_path || "";
     $("net_proxy_port").value = state.proxy_port || 7928;
+    $("net_proxy_user").value = state.proxy_user || ""; // 新增这一行
+    $("net_proxy_pass").value = state.proxy_pass || ""; // 新增这一行
   }
   
   populateRoutingCountries();
@@ -3825,6 +3838,8 @@ async function saveNetwork(e) {
   const port = parseInt($("net_port").value);
   const suffix = $("net_suffix").value.trim();
   const proxyPort = parseInt($("net_proxy_port").value);
+  const proxyUser = $("net_proxy_user").value.trim(); // 新增这一行
+  const proxyPass = $("net_proxy_pass").value.trim(); // 新增这一行
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   
@@ -3869,6 +3884,8 @@ async function saveNetwork(e) {
         port: port,
         secret_path: suffix,
         proxy_port: proxyPort,
+        proxy_user: proxyUser, // 新增这一行
+        proxy_pass: proxyPass, // 新增这一行
         routing_mode: routingMode,
         force_country: forceCountry
       })
@@ -4665,6 +4682,9 @@ class Handler(BaseHTTPRequestHandler):
                 new_port = payload.get("port")
                 new_suffix = str(payload.get("secret_path") or "").strip()
                 new_proxy_port = payload.get("proxy_port")
+                # 新增以下两行，接收前端网页传来的账号和密码
+                new_proxy_user = str(payload.get("proxy_user") or "").strip() 
+                new_proxy_pass = str(payload.get("proxy_pass") or "").strip()
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 
@@ -4704,6 +4724,9 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["port"] = new_port_int
                 ui_cfg["secret_path"] = new_suffix
                 ui_cfg["proxy_port"] = new_proxy_port_int
+                # 新增以下两行，写入配置文件
+                ui_cfg["proxy_user"] = new_proxy_user 
+                ui_cfg["proxy_pass"] = new_proxy_pass
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 
