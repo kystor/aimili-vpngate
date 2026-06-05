@@ -164,16 +164,153 @@ def relay(left: socket.socket, right: socket.socket) -> None:
                 return
             target.sendall(data)
 
+def socks5_udp_relay(tcp_client: socket.socket) -> None:
+    """
+    处理 SOCKS5 的 UDP ASSOCIATE (UDP 代理穿透) 逻辑
+    Hysteria 2、Xray 等支持 UDP 代理的内核都需要依赖这个功能
+    """
+    udp_server = None
+    outbound_udp = None
+    try:
+        # 获取与客户端建立 TCP 连接的本地 IP，用于绑定 UDP 监听
+        local_ip = tcp_client.getsockname()[0]
+        af = socket.AF_INET6 if ":" in local_ip else socket.AF_INET
+        
+        # 1. 创建本地 UDP 服务端监听客户端的 UDP 发包
+        udp_server = socket.socket(af, socket.SOCK_DGRAM)
+        # 端口填 0 让操作系统自动分配一个闲置端口
+        udp_server.bind((local_ip, 0))
+        bound_ip, bound_port = udp_server.getsockname()
+        
+        # 2. 将分配好的 IP 和 端口通过 TCP 应答告诉客户端
+        if af == socket.AF_INET:
+            reply = b"\x05\x00\x00\x01" + socket.inet_aton(bound_ip) + bound_port.to_bytes(2, "big")
+        else:
+            reply = b"\x05\x00\x00\x04" + socket.inet_pton(socket.AF_INET6, bound_ip) + bound_port.to_bytes(2, "big")
+        tcp_client.sendall(reply)
+        
+        # 3. 创建负责跟外网目标通信的“出站 UDP”套接字
+        outbound_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # 这一步极其关键，强制使 UDP 流量走 tun0 虚拟网卡 (即 VPN 隧道)
+            outbound_udp.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+        except OSError as e:
+            # 如果尚未连接成功 tun0，给出提示但继续运行
+            print(f"[UDP绑定警告] 绑定 tun0 失败，流量可能未走 VPN: {e}", flush=True)
+            pass
+            
+        sockets = [tcp_client, udp_server, outbound_udp]
+        client_addr = None # 用于缓存发起 UDP 请求的客户端真实地址
+        
+        # 4. 进入 I/O 多路复用循环，处理收发数据
+        while True:
+            readable, _, errored = select.select(sockets, [], sockets, 120)
+            if errored:
+                break
+                
+            # 【TCP 断开监控】按照 SOCKS5 规范，如果客户端主动断开了主 TCP 握手连接，UDP 转发应当立即终止
+            if tcp_client in readable:
+                data = tcp_client.recv(256)
+                if not data:
+                    break 
+                    
+            # 【接收客户端 UDP 包】-> 拆除 SOCKS5 头部 -> 发送至真实外网目标
+            if udp_server in readable:
+                data, addr = udp_server.recvfrom(65536)
+                client_addr = addr # 记录客户端地址，便于后续回传
+                
+                # 校验 SOCKS5 UDP 数据包长度
+                if len(data) < 10:
+                    continue
+                    
+                # 协议头部字段: RSV(2字节) | FRAG(1字节) | ATYP(1字节) | DST.ADDR | DST.PORT(2字节) | DATA
+                frag = data[2]
+                if frag != 0:
+                    continue # 暂不支持 UDP 分片包处理
+                    
+                atyp = data[3]
+                offset = 4
+                
+                # 提取目标 IP
+                if atyp == 1: # IPv4
+                    dst_ip = socket.inet_ntoa(data[offset:offset+4])
+                    offset += 4
+                elif atyp == 3: # 域名
+                    domain_len = data[offset]
+                    offset += 1
+                    dst_host = data[offset:offset+domain_len].decode("idna")
+                    offset += domain_len
+                    # 强行通过 tun0 网卡进行 DNS 解析
+                    resolved_ip = resolve_dns_over_tun0(dst_host)
+                    dst_ip = resolved_ip if resolved_ip else dst_host
+                elif atyp == 4: # IPv6
+                    dst_ip = socket.inet_ntop(socket.AF_INET6, data[offset:offset+16])
+                    offset += 16
+                else:
+                    continue
+                    
+                # 提取目标端口
+                dst_port = int.from_bytes(data[offset:offset+2], "big")
+                offset += 2
+                
+                # 剩余部分即为原始的用户数据负载
+                payload = data[offset:]
+                
+                # 通过绑定的出口套接字发送到外网
+                try:
+                    outbound_udp.sendto(payload, (dst_ip, dst_port))
+                except Exception:
+                    pass
+                    
+            # 【接收外网目标响应数据】-> 拼接 SOCKS5 头部 -> 退回给客户端
+            if outbound_udp in readable:
+                data, addr = outbound_udp.recvfrom(65536)
+                if not client_addr:
+                    continue # 如果尚未记录客户端来源，则无法发回
+                    
+                src_ip, src_port = addr
+                
+                # 封装外网目标地址信息到 SOCKS5 头
+                if ":" in src_ip:
+                    header = b"\x00\x00\x00\x04" + socket.inet_pton(socket.AF_INET6, src_ip) + src_port.to_bytes(2, "big")
+                else:
+                    header = b"\x00\x00\x00\x01" + socket.inet_aton(src_ip) + src_port.to_bytes(2, "big")
+                    
+                # 连同真实数据发回客户端代理软件
+                try:
+                    udp_server.sendto(header + data, client_addr)
+                except Exception:
+                    pass
+                    
+    except Exception as e:
+        print(f"[UDP代理异常] 会话终止: {e}", flush=True)
+    finally:
+        # 严谨的资源清理，防止端口泄露和挂起
+        if udp_server:
+            try: udp_server.close()
+            except: pass
+        if outbound_udp:
+            try: outbound_udp.close()
+            except: pass
+
 def socks5_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
     try:
+        # SOCKS5 握手认证阶段
         methods_count = recv_exact(client, 1)[0]
         recv_exact(client, methods_count)
+        # 响应无需密码认证
         client.sendall(b"\x05\x00")
+        
+        # 接收客户端请求详情
         version, command, _, address_type = recv_exact(client, 4)
-        if version != 5 or command != 1:
+        
+        # 仅支持 CONNECT (1) 和 UDP ASSOCIATE (3)
+        if version != 5 or command not in (1, 3):
+            # 发送指令不支持的错误码 (0x07)
             client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
             return
+            
         if address_type == 1:
             host = socket.inet_ntoa(recv_exact(client, 4))
         elif address_type == 3:
@@ -183,18 +320,27 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         else:
             client.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
             return
+            
         port = int.from_bytes(recv_exact(client, 2), "big")
-        try:
-            upstream = create_connection((host, port), timeout=20)
-        except Exception as e:
-            print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
+        
+        if command == 1:
+            # [原逻辑] 处理传统的 TCP CONNECT 请求
             try:
-                client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
-            except OSError:
-                pass
-            raise
-        client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-        relay(client, upstream)
+                upstream = create_connection((host, port), timeout=20)
+            except Exception as e:
+                print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
+                try:
+                    client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                except OSError:
+                    pass
+                raise
+            client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            relay(client, upstream)
+            
+        elif command == 3:
+            # [新增] 将连接移交给 UDP 处理守护函数
+            socks5_udp_relay(client)
+            
     finally:
         client.close()
         if upstream:
