@@ -81,12 +81,15 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "1260"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1260"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
-MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
+# 【优化】将默认单次从 API 扫描的最大节点数量从 300 提升到 2000
+# 这样可以一次性把官方 API 接口返回的所有可用节点全部吃进内存
+MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "2000"))
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
-LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
+# 将原本的 "127.0.0.1" 修改为 "0.0.0.0"，以允许公网的 hy2 节点连接本机的代理端口
+LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "0.0.0.0")
 LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
@@ -860,11 +863,18 @@ def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # 【优化】对可用节点进行重新排序，强制优先选择底层的 UDP 节点
     available_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "available" or n.get("active")],
         key=lambda n: (
+            # 排序权重 1：协议类型。如果是 udp，值为 0（排在最前面）；否则为 1。
+            # 这能彻底避免 TCP over TCP 导致的 hy2 降速问题
+            0 if n.get("proto") == "udp" else 1, 
+            # 排序权重 2：IP 类型。优先选择住宅或移动 IP
             0 if n.get("ip_type") in ("residential", "mobile") else 1,
+            # 排序权重 3：直连延迟。延迟越低越好
             parse_int(n.get("latency_ms")) or 999999,
+            # 排序权重 4：节点健康度评分
             -parse_int(n.get("score"))
         )
     )
@@ -1028,7 +1038,9 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    max_workers = min(30, max(1, len(to_test)))
+    # 【优化】将最大并发测速线程数从 30 提升到 60
+    # 这样能大幅缩短海量节点的批量连通性检测时间，但又不会因为线程过多导致系统崩溃
+    max_workers = min(60, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
@@ -1320,8 +1332,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     merged.append(cand)
                     seen_ids.add(cand["id"])
                     
-            if len(merged) > 1000:
-                merged = merged[:1000]
+            # 【优化】将本地节点池的文件缓存上限扩大到 3000
+            # 防止获取到的海量节点在合并去重时被直接丢弃
+            if len(merged) > 3000:
+                merged = merged[:3000]
                 
             for n in merged:
                 config_path = Path(n["config_file"])
