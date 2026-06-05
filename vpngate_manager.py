@@ -2443,7 +2443,7 @@ INDEX_HTML = r"""<!doctype html>
       width: 100%;
       border-collapse: collapse;
       text-align: left;
-      min-width: 1000px;
+      min-width: 1320px;
     }
 
     th, td {
@@ -2458,6 +2458,34 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.8px;
+      color: var(--text-secondary);
+    }
+
+    .col-status { width: 110px; }
+    .col-latency { width: 100px; }
+    .col-endpoint { width: 220px; }
+    .col-location { width: 240px; }
+    .col-asn { width: 170px; }
+    .col-owner { width: 240px; }
+    .col-quality { width: 110px; }
+    .col-ip-type { width: 110px; }
+    .col-actions { width: 160px; }
+
+    .cell-wrap {
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: anywhere;
+      line-height: 1.45;
+    }
+
+    .cell-location {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .cell-asn,
+    .cell-owner {
+      font-size: 12px;
       color: var(--text-secondary);
     }
 
@@ -2904,18 +2932,18 @@ INDEX_HTML = r"""<!doctype html>
   </section>
   <div class="table-wrapper">
     <div class="table-container">
-      <table>
+          <table>
         <thead>
           <tr>
-            <th style="width: 110px;">状态</th>
-            <th style="width: 100px;">延迟</th>
-            <th style="width: 220px;">IP 地址 : 端口</th>
-            <th>物理位置</th>
-            <th style="width: 100px;">ASN</th>
-            <th>运营主体 / ISP</th>
-            <th style="width: 110px;">网络质量</th>
-            <th style="width: 110px;">IP 类型</th>
-            <th style="width: 160px;">操作</th>
+            <th class="col-status">状态</th>
+            <th class="col-latency">延迟</th>
+            <th class="col-endpoint">IP 地址 : 端口</th>
+            <th class="col-location">物理位置</th>
+            <th class="col-asn">ASN</th>
+            <th class="col-owner">运营主体 / ISP</th>
+            <th class="col-quality">网络质量</th>
+            <th class="col-ip-type">IP 类型</th>
+            <th class="col-actions">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -3577,6 +3605,8 @@ function render(){
       const latencyClass = getLatencyClass(n.latency_ms);
       const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
+      const displayAsn = n.asn || "-";
+      const displayOwner = n.owner || n.as_name || "-";
       
       const isTesting = testingNodeIds.has(n.id);
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
@@ -3597,9 +3627,9 @@ function render(){
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td>${latencyText}</td>
         <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}<div style="margin-top:4px; font-size:11px; color:var(--text-secondary);">${esc(translateProtocol(n.proto))}</div></td>
-        <td>${esc(displayLocation)}</td>
-        <td class="mono" style="font-size:12px; color:var(--text-secondary);">${esc(n.asn||"-")}</td>
-        <td>${esc(n.owner||n.as_name||"-")}</td>
+        <td class="cell-wrap cell-location">${esc(displayLocation)}</td>
+        <td class="mono cell-wrap cell-asn">${esc(displayAsn)}</td>
+        <td class="cell-wrap cell-owner">${esc(displayOwner)}</td>
         <td>${esc(translateQuality(n.quality))}</td>
         <td>${esc(translateIpType(n.ip_type))}</td>
         <td>
@@ -3801,10 +3831,10 @@ $("btn_batch_test").onclick = async () => {
 // 新增：批量测试所有获取到节点的实现逻辑
 // ==========================================
 $("btn_batch_test_all").onclick = async () => {
-  // 1. 获取本地存储的所有备选节点
-  const allNodes = nodes || [];
-  if (allNodes.length === 0) {
-    alert("当前没有获取到任何备选节点，请先等待列表加载。");
+  // 1. 只测试当前筛选条件下的全部节点，而不是所有已获取节点
+  const filteredNodes = getFilteredNodes();
+  if (filteredNodes.length === 0) {
+    alert("当前筛选条件下没有可供测试的备选节点。");
     return;
   }
   
@@ -3816,11 +3846,11 @@ $("btn_batch_test_all").onclick = async () => {
   btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width: 14px; height: 14px; display: inline-block; margin-right: 6px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>全部测试中...`;
 
   // 2. 将所有节点在界面上先标记为“检测中”
-  allNodes.forEach(n => testingNodeIds.add(n.id));
+  filteredNodes.forEach(n => testingNodeIds.add(n.id));
   render();
 
   // 提取出所有节点的 ID，准备发送给后台
-  const allIds = allNodes.map(n => n.id);
+  const allIds = filteredNodes.map(n => n.id);
   
   // 3. 分批调用后端批量测试接口，严格限制单批大小，避免小 VPS 被瞬间压满
   const chunkSize = 10;
