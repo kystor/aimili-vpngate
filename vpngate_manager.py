@@ -536,6 +536,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 rows = parse_vpngate_rows(api_text)
                 
                 # [优化注释] 这里会按照上面设定的 2000 行上限进行遍历，配合自带的 IP 去重逻辑，榨干所有有效节点
+                # 遍历截取到的所有节点行数据
                 for row in rows[:MAX_SCAN_ROWS]:
                     ip = row.get("IP", "")
                     if not ip or ip in seen_ips:
@@ -543,10 +544,20 @@ def fetch_candidates() -> list[dict[str, Any]]:
                     encoded = row.get("OpenVPN_ConfigData_Base64", "")
                     if not encoded:
                         continue
+                    
+                    # 将 Base64 解码为真实的 OpenVPN 配置文件文本
                     config_text = decode_config(encoded)
+                    # 将文本解析成节点对象 (里面包含了 IP、端口、协议等信息)
                     node = row_to_node(row, config_text)
-                    candidates.append(node)
-                    seen_ips.add(ip)
+                    
+                    # 【新增的严格筛选逻辑】提取解析出的底层协议
+                    # 只有当 OpenVPN 的底层传输协议是 "udp" 时，才允许加入备选库
+                    if node.get("proto", "").lower() == "udp":
+                        candidates.append(node)
+                        seen_ips.add(ip)
+                    else:
+                        # 如果是 tcp 协议的节点，我们直接丢弃，不加入备选列表
+                        continue
                 if candidates:
                     break
             except Exception as e:
