@@ -184,9 +184,12 @@ def socks5_udp_relay(tcp_client: socket.socket) -> None:
         
         # 2. 将分配好的 IP 和 端口通过 TCP 应答告诉客户端
         if af == socket.AF_INET:
-            reply = b"\x05\x00\x00\x01" + socket.inet_aton(bound_ip) + bound_port.to_bytes(2, "big")
+            # 【优化】为了支持公网访问和 NAT 穿透，不要返回本地绑定的内网 IP (bound_ip)。
+            # 我们直接返回 0.0.0.0，告诉 hy2 客户端直接使用与 TCP 握手相同的服务器公网 IP 发送 UDP 数据。
+            reply = b"\x05\x00\x00\x01\x00\x00\x00\x00" + bound_port.to_bytes(2, "big")
         else:
-            reply = b"\x05\x00\x00\x04" + socket.inet_pton(socket.AF_INET6, bound_ip) + bound_port.to_bytes(2, "big")
+            # 【优化】对于 IPv6 同理，返回全 0 的 :: 
+            reply = b"\x05\x00\x00\x04" + (b"\x00" * 16) + bound_port.to_bytes(2, "big")
         tcp_client.sendall(reply)
         
         # 3. 创建负责跟外网目标通信的“出站 UDP”套接字
