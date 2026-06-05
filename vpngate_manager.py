@@ -88,6 +88,11 @@ MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "2000"))
 ENABLE_MIRROR_AGGREGATION = str(os.environ.get("ENABLE_MIRROR_AGGREGATION", "1")).strip().lower() not in ("0", "false", "no", "off")
 MAX_MIRROR_SOURCES = int(os.environ.get("MAX_MIRROR_SOURCES", "8"))
 MIRROR_LIST_CACHE_SECONDS = int(os.environ.get("MIRROR_LIST_CACHE_SECONDS", "1800"))
+MAX_CONCURRENT_TEST_WORKERS = int(os.environ.get("MAX_CONCURRENT_TEST_WORKERS", "30"))
+MAX_BACKGROUND_TEST_NODES = int(os.environ.get("MAX_BACKGROUND_TEST_NODES", "60"))
+MAX_BATCH_TEST_REQUEST_SIZE = int(os.environ.get("MAX_BATCH_TEST_REQUEST_SIZE", "20"))
+MANUAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("MANUAL_TEST_TIMEOUT_SECONDS", "8"))
+BACKGROUND_TEST_TIMEOUT_SECONDS = int(os.environ.get("BACKGROUND_TEST_TIMEOUT_SECONDS", "8"))
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
@@ -127,6 +132,8 @@ AUTO_SWITCH_FETCH_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SWITCH_FETCH_COOLD
 AUTO_SWITCH_NO_CANDIDATE_LOG_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SWITCH_NO_CANDIDATE_LOG_COOLDOWN_SECONDS", "30"))
 mirror_api_urls_cache: list[str] = []
 mirror_api_urls_cache_expires_at = 0.0
+maintain_job_lock = threading.Lock()
+test_job_semaphore = threading.BoundedSemaphore(max(1, MAX_CONCURRENT_TEST_WORKERS))
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -1042,7 +1049,7 @@ def release_test_index(idx: int) -> None:
     with test_indexes_lock:
         active_test_indexes.discard(idx)
 
-def test_node_by_id(node_id: str) -> dict[str, Any]:
+def test_node_by_id(node_id: str, timeout: int | None = None) -> dict[str, Any]:
     with lock:
         nodes = read_json(NODES_FILE, [])
         node = next((item for item in nodes if item.get("id") == node_id), None)
@@ -1063,16 +1070,23 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
 
     latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
     
-    idx = get_free_test_index()
-    try:
-        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
-    finally:
-        release_test_index(idx)
+    with test_job_semaphore:
+        idx = get_free_test_index()
         try:
-            if temp_path.exists():
-                temp_path.unlink()
-        except Exception:
-            pass
+            ok, message, _ = run_openvpn_until_ready(
+                config_file,
+                keep_alive=False,
+                route_nopull=True,
+                timeout=timeout if timeout is not None else MANUAL_TEST_TIMEOUT_SECONDS,
+                dev=f"tun{idx}",
+            )
+        finally:
+            release_test_index(idx)
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
 
     temp_node = {
         "id": node_id,
@@ -1146,17 +1160,24 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             }
             
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
-        tun_idx = get_free_test_index()
-        dev_name = f"tun{tun_idx}"
-        try:
-            ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
-        finally:
-            release_test_index(tun_idx)
+        with test_job_semaphore:
+            tun_idx = get_free_test_index()
+            dev_name = f"tun{tun_idx}"
             try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except Exception:
-                pass
+                ok, message, _ = run_openvpn_until_ready(
+                    config_file,
+                    keep_alive=False,
+                    route_nopull=True,
+                    timeout=BACKGROUND_TEST_TIMEOUT_SECONDS,
+                    dev=dev_name,
+                )
+            finally:
+                release_test_index(tun_idx)
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except Exception:
+                    pass
             
         temp_node = {
             "id": node_id,
@@ -1177,9 +1198,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    # 【优化】将最大并发测速线程数从 30 提升到 50
-    # 这样能大幅缩短海量节点的批量连通性检测时间，但又不会因为线程过多导致系统崩溃
-    max_workers = min(50, max(1, len(to_test)))
+    max_workers = min(MAX_CONCURRENT_TEST_WORKERS, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
@@ -1426,6 +1445,8 @@ def connect_node(node_id: str) -> str:
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
+    if not maintain_job_lock.acquire(blocking=False):
+        return "后台节点更新已在进行中"
     ensure_dirs()
     is_connecting = True
     try:
@@ -1514,11 +1535,12 @@ def maintain_valid_nodes(force: bool = False) -> str:
         with lock:
             current_nodes = read_json(NODES_FILE, [])
             to_test = [n for n in current_nodes if not n.get("active")]
-            to_test_ids = [n["id"] for n in to_test]
+            to_test_ids = [n["id"] for n in to_test[:MAX_BACKGROUND_TEST_NODES]]
             
-        print(f"[维护线程] 正在并发检测列表中所有节点，共 {len(to_test_ids)} 个...", flush=True)
-        set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
-        test_multiple_nodes(to_test_ids)
+        print(f"[维护线程] 正在检测候选节点，共选择 {len(to_test_ids)} / {len(to_test)} 个优先节点...", flush=True)
+        set_state(is_connecting=True, last_check_message=f"正在分批检测候选节点可用性（本轮 {len(to_test_ids)} 个）...")
+        if to_test_ids:
+            test_multiple_nodes(to_test_ids)
         
         is_connecting = False
         
@@ -1548,7 +1570,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        message = f"Fetched {len(candidates)} nodes. Tested first 10 nodes."
+        message = f"Fetched {len(candidates)} nodes. Tested {min(len(to_test_ids), len(current_nodes))} prioritized nodes."
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
@@ -1559,6 +1581,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
     except Exception as e:
         is_connecting = False
         raise e
+    finally:
+        try:
+            maintain_job_lock.release()
+        except RuntimeError:
+            pass
 
 
 def collector_loop() -> None:
@@ -3736,31 +3763,33 @@ $("btn_batch_test").onclick = async () => {
   
   pageNodes.forEach(n => testingNodeIds.add(n.id));
   render();
-  
-  const testPromises = pageNodes.map(async (n) => {
-    const id = n.id;
-    try {
-      const response = await fetch("./api/test_node", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id })
-      });
-      const result = await response.json();
-      if (result.ok && result.node) {
-        const idx = nodes.findIndex(item => item.id === id);
-        if (idx !== -1) {
-          nodes[idx] = result.node;
+
+  try {
+    const ids = pageNodes.map(n => n.id);
+    const chunkSize = 4;
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunkIds = ids.slice(i, i + chunkSize);
+      for (const id of chunkIds) {
+        try {
+          const response = await fetch("./api/test_node", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id })
+          });
+          const result = await response.json();
+          if (result.ok && result.node) {
+            const idx = nodes.findIndex(item => item.id === id);
+            if (idx !== -1) {
+              nodes[idx] = result.node;
+            }
+          }
+        } catch (e) {
+        } finally {
+          testingNodeIds.delete(id);
+          render();
         }
       }
-    } catch (e) {
-    } finally {
-      testingNodeIds.delete(id);
-      render();
     }
-  });
-  
-  try {
-    await Promise.all(testPromises);
   } catch (e) {
   } finally {
     btn.disabled = false;
@@ -3793,8 +3822,8 @@ $("btn_batch_test_all").onclick = async () => {
   // 提取出所有节点的 ID，准备发送给后台
   const allIds = allNodes.map(n => n.id);
   
-  // 3. 核心分批逻辑：为了防止一次性测试几千个节点导致请求超时，我们每次向后端发送 50 个节点进行测试
-  const chunkSize = 50;
+  // 3. 分批调用后端批量测试接口，严格限制单批大小，避免小 VPS 被瞬间压满
+  const chunkSize = 10;
 
   for (let i = 0; i < allIds.length; i += chunkSize) {
     const chunkIds = allIds.slice(i, i + chunkSize);
@@ -3812,10 +3841,10 @@ $("btn_batch_test_all").onclick = async () => {
         result.nodes.forEach(updatedNode => {
           // 找到当前列表中对应的节点并覆盖其状态和延迟
           const idx = nodes.findIndex(item => item.id === updatedNode.id);
-          if (idx !== -1) {
-            nodes[idx] = updatedNode; 
-          }
-        });
+        if (idx !== -1) {
+          nodes[idx] = updatedNode; 
+        }
+      });
       }
     } catch (e) {
       console.error("批量测试请求失败:", e);
@@ -5153,15 +5182,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_nodes":
             try:
-                threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
-                self.send_json({"ok": True, "message": "已在后台启动节点更新流程"})
+                if maintain_job_lock.locked():
+                    self.send_json({"ok": True, "message": "后台节点更新已在进行中，请稍候刷新"})
+                else:
+                    threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
+                    self.send_json({"ok": True, "message": "已在后台启动节点更新流程"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_nodes":
             try:
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                node_ids = payload.get("ids", [])
+                node_ids = list(payload.get("ids", []))[:MAX_BATCH_TEST_REQUEST_SIZE]
                 tested_nodes = test_multiple_nodes(node_ids)
                 self.send_json({"ok": True, "nodes": tested_nodes})
             except Exception as exc:
