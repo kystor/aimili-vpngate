@@ -5,6 +5,9 @@ import socket
 import threading
 import urllib.parse
 import time
+import json        # [新增] 引入 json 库，用于读取保存账号密码的配置文件
+import os          # [新增] 引入 os 库，用于处理文件路径
+from pathlib import Path # [新增] 引入 Path，用于安全获取当前文件所在目录
 from typing import Any
 
 def parse_int(value: Any) -> int:
@@ -14,6 +17,7 @@ def parse_int(value: Any) -> int:
         return 0
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
+    """辅助函数：确保从套接字中读取到指定大小的字节，防止数据断流"""
     data = b""
     while len(data) < size:
         chunk = sock.recv(size - len(data))
@@ -22,7 +26,33 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         data += chunk
     return data
 
+# =====================================================================
+# [新增] 读取代理验证信息的函数
+# =====================================================================
+def get_proxy_credentials():
+    """
+    读取保存在管理面板的 SOCKS5 代理账号和密码。
+    这个函数会在每次有新客户端连接时被调用，所以你在网页后台修改密码后，
+    不需要重启服务就能立即生效。
+    """
+    try:
+        # 获取当前 proxy_server.py 文件所在目录，拼接出 ui_auth.json 的完整路径
+        base_dir = Path(__file__).resolve().parent
+        auth_file = base_dir / "vpngate_data" / "ui_auth.json"
+        
+        # 如果文件存在，就读取里面的 JSON 数据
+        if auth_file.exists():
+            data = json.loads(auth_file.read_text(encoding="utf-8"))
+            # 返回字典中的 proxy_user 和 proxy_pass，如果没有就返回空字符串
+            return data.get("proxy_user", ""), data.get("proxy_pass", "")
+    except Exception:
+        # 如果读取过程中发生任何错误（例如文件格式坏了），为了不让程序崩溃，直接忽略
+        pass
+    # 默认返回空，代表不需要密码验证
+    return "", ""
+
 def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+    """通过虚拟网卡 tun0 进行 DNS 解析，确保解析过程也走 VPN 隧道"""
     try:
         socket.inet_aton(host)
         return host
@@ -123,6 +153,7 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
     return None
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+    """创建前往目标的 TCP 连接，强制绑定 tun0 网卡实现透明代理"""
     host, port = address
     resolved_ip = resolve_dns_over_tun0(host)
     if resolved_ip:
@@ -141,9 +172,9 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         except OSError as e:
             err = e
             if "operation not permitted" in str(e).lower() or e.errno == 1:
-                err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定虚拟网卡 tun0 失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
+                err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定虚拟网卡 tun0 失败，权限不足！必须以 root 权限运行。")
             elif "no such device" in str(e).lower() or e.errno == 19:
-                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 tun0 失败，找不到设备！这通常是因为 OpenVPN 核心未能成功连接或已被异常终止。")
+                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 tun0 失败，找不到设备！")
             if sock is not None:
                 sock.close()
     if err is not None:
@@ -152,6 +183,7 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         raise OSError("getaddrinfo returns empty list")
 
 def relay(left: socket.socket, right: socket.socket) -> None:
+    """双向转发 TCP 数据流"""
     sockets = [left, right]
     while True:
         readable, _, errored = select.select(sockets, [], sockets, 120)
@@ -172,114 +204,99 @@ def socks5_udp_relay(tcp_client: socket.socket) -> None:
     udp_server = None
     outbound_udp = None
     try:
-        # 获取与客户端建立 TCP 连接的本地 IP，用于绑定 UDP 监听
         local_ip = tcp_client.getsockname()[0]
         af = socket.AF_INET6 if ":" in local_ip else socket.AF_INET
         
         # 1. 创建本地 UDP 服务端监听客户端的 UDP 发包
         udp_server = socket.socket(af, socket.SOCK_DGRAM)
-        # 端口填 0 让操作系统自动分配一个闲置端口
         udp_server.bind((local_ip, 0))
         bound_ip, bound_port = udp_server.getsockname()
         
         # 2. 将分配好的 IP 和 端口通过 TCP 应答告诉客户端
+        # 【优化】修复 NAT 公网穿透。不返回绑定的内网 IP，而是返回 0.0.0.0
+        # 这样 hy2 客户端就能聪明地复用主机的公网 IP 来发送 UDP 流量了。
         if af == socket.AF_INET:
-            # 【优化】为了支持公网访问和 NAT 穿透，不要返回本地绑定的内网 IP (bound_ip)。
-            # 我们直接返回 0.0.0.0，告诉 hy2 客户端直接使用与 TCP 握手相同的服务器公网 IP 发送 UDP 数据。
+            # 0.0.0.0 的字节表示为 \x00\x00\x00\x00
             reply = b"\x05\x00\x00\x01\x00\x00\x00\x00" + bound_port.to_bytes(2, "big")
         else:
-            # 【优化】对于 IPv6 同理，返回全 0 的 :: 
+            # :: 的字节表示为 16 个 \x00
             reply = b"\x05\x00\x00\x04" + (b"\x00" * 16) + bound_port.to_bytes(2, "big")
         tcp_client.sendall(reply)
         
         # 3. 创建负责跟外网目标通信的“出站 UDP”套接字
         outbound_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            # 这一步极其关键，强制使 UDP 流量走 tun0 虚拟网卡 (即 VPN 隧道)
             outbound_udp.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
         except OSError as e:
-            # 如果尚未连接成功 tun0，给出提示但继续运行
             print(f"[UDP绑定警告] 绑定 tun0 失败，流量可能未走 VPN: {e}", flush=True)
             pass
             
         sockets = [tcp_client, udp_server, outbound_udp]
-        client_addr = None # 用于缓存发起 UDP 请求的客户端真实地址
+        client_addr = None
         
-        # 4. 进入 I/O 多路复用循环，处理收发数据
+        # 4. 进入 I/O 多路复用循环
         while True:
             readable, _, errored = select.select(sockets, [], sockets, 120)
             if errored:
                 break
                 
-            # 【TCP 断开监控】按照 SOCKS5 规范，如果客户端主动断开了主 TCP 握手连接，UDP 转发应当立即终止
             if tcp_client in readable:
                 data = tcp_client.recv(256)
                 if not data:
                     break 
                     
-            # 【接收客户端 UDP 包】-> 拆除 SOCKS5 头部 -> 发送至真实外网目标
             if udp_server in readable:
                 data, addr = udp_server.recvfrom(65536)
-                client_addr = addr # 记录客户端地址，便于后续回传
+                client_addr = addr
                 
-                # 校验 SOCKS5 UDP 数据包长度
                 if len(data) < 10:
                     continue
                     
-                # 协议头部字段: RSV(2字节) | FRAG(1字节) | ATYP(1字节) | DST.ADDR | DST.PORT(2字节) | DATA
                 frag = data[2]
                 if frag != 0:
-                    continue # 暂不支持 UDP 分片包处理
+                    continue
                     
                 atyp = data[3]
                 offset = 4
                 
-                # 提取目标 IP
-                if atyp == 1: # IPv4
+                if atyp == 1:
                     dst_ip = socket.inet_ntoa(data[offset:offset+4])
                     offset += 4
-                elif atyp == 3: # 域名
+                elif atyp == 3:
                     domain_len = data[offset]
                     offset += 1
                     dst_host = data[offset:offset+domain_len].decode("idna")
                     offset += domain_len
-                    # 强行通过 tun0 网卡进行 DNS 解析
                     resolved_ip = resolve_dns_over_tun0(dst_host)
                     dst_ip = resolved_ip if resolved_ip else dst_host
-                elif atyp == 4: # IPv6
+                elif atyp == 4:
                     dst_ip = socket.inet_ntop(socket.AF_INET6, data[offset:offset+16])
                     offset += 16
                 else:
                     continue
                     
-                # 提取目标端口
                 dst_port = int.from_bytes(data[offset:offset+2], "big")
                 offset += 2
                 
-                # 剩余部分即为原始的用户数据负载
                 payload = data[offset:]
                 
-                # 通过绑定的出口套接字发送到外网
                 try:
                     outbound_udp.sendto(payload, (dst_ip, dst_port))
                 except Exception:
                     pass
                     
-            # 【接收外网目标响应数据】-> 拼接 SOCKS5 头部 -> 退回给客户端
             if outbound_udp in readable:
                 data, addr = outbound_udp.recvfrom(65536)
                 if not client_addr:
-                    continue # 如果尚未记录客户端来源，则无法发回
+                    continue
                     
                 src_ip, src_port = addr
                 
-                # 封装外网目标地址信息到 SOCKS5 头
                 if ":" in src_ip:
                     header = b"\x00\x00\x00\x04" + socket.inet_pton(socket.AF_INET6, src_ip) + src_port.to_bytes(2, "big")
                 else:
                     header = b"\x00\x00\x00\x01" + socket.inet_aton(src_ip) + src_port.to_bytes(2, "big")
                     
-                # 连同真实数据发回客户端代理软件
                 try:
                     udp_server.sendto(header + data, client_addr)
                 except Exception:
@@ -288,7 +305,6 @@ def socks5_udp_relay(tcp_client: socket.socket) -> None:
     except Exception as e:
         print(f"[UDP代理异常] 会话终止: {e}", flush=True)
     finally:
-        # 严谨的资源清理，防止端口泄露和挂起
         if udp_server:
             try: udp_server.close()
             except: pass
@@ -297,20 +313,64 @@ def socks5_udp_relay(tcp_client: socket.socket) -> None:
             except: pass
 
 def socks5_client(client: socket.socket, first_byte: bytes) -> None:
+    """
+    SOCKS5 主控制逻辑
+    """
     upstream = None
     try:
-        # SOCKS5 握手认证阶段
+        # ==========================================
+        # [修改] SOCKS5 握手认证阶段 (支持密码验证)
+        # ==========================================
+        # 1. 接收客户端支持的认证方式数量
         methods_count = recv_exact(client, 1)[0]
-        recv_exact(client, methods_count)
-        # 响应无需密码认证
-        client.sendall(b"\x05\x00")
+        methods = recv_exact(client, methods_count)
         
-        # 接收客户端请求详情
+        # 2. 读取我们在网页后台配置的账号密码
+        p_user, p_pass = get_proxy_credentials()
+        
+        # 3. 核心校验逻辑
+        if p_user and p_pass:
+            # 如果配置了账号密码，检查客户端（比如你的 hy2）是否支持密码认证 (协议代号为 2)
+            if 2 not in methods:
+                # \x05 代表 SOCKS5 协议，\xFF 代表拒绝（没有支持的认证方法）
+                client.sendall(b"\x05\xFF") 
+                return
+            
+            # 告诉客户端：你支持密码认证，请把账号密码发过来 (\x02 代表用户名密码认证)
+            client.sendall(b"\x05\x02")
+            
+            # 开始接收客户端发来的账号密码数据包
+            auth_version = recv_exact(client, 1)[0]
+            if auth_version != 1:
+                client.sendall(b"\x01\x01") # 版本不对，认证失败
+                return
+            
+            # 解析客户端发来的用户名
+            user_len = recv_exact(client, 1)[0]
+            user = recv_exact(client, user_len).decode("utf-8")
+            
+            # 解析客户端发来的密码
+            pass_len = recv_exact(client, 1)[0]
+            password = recv_exact(client, pass_len).decode("utf-8")
+            
+            # 进行比对
+            if user == p_user and password == p_pass:
+                # 账号密码正确，返回 \x01\x00 (成功)
+                client.sendall(b"\x01\x00") 
+            else:
+                # 账号密码错误，返回 \x01\x01 (失败) 并断开连接
+                client.sendall(b"\x01\x01") 
+                return
+        else:
+            # 如果后台留空了账号密码，就告诉客户端不需要认证 (协议代号为 0)
+            client.sendall(b"\x05\x00")
+        
+        # ==========================================
+        # 4. 认证成功后，继续接收客户端的连接请求
+        # ==========================================
         version, command, _, address_type = recv_exact(client, 4)
         
-        # 仅支持 CONNECT (1) 和 UDP ASSOCIATE (3)
         if version != 5 or command not in (1, 3):
-            # 发送指令不支持的错误码 (0x07)
             client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
             return
             
@@ -327,7 +387,6 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         port = int.from_bytes(recv_exact(client, 2), "big")
         
         if command == 1:
-            # [原逻辑] 处理传统的 TCP CONNECT 请求
             try:
                 upstream = create_connection((host, port), timeout=20)
             except Exception as e:
@@ -341,7 +400,6 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             relay(client, upstream)
             
         elif command == 3:
-            # [新增] 将连接移交给 UDP 处理守护函数
             socks5_udp_relay(client)
             
     finally:
@@ -350,6 +408,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             upstream.close()
 
 def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
+    """读取 HTTP 代理请求头部"""
     data = first_byte
     while b"\r\n\r\n" not in data and len(data) < 65536:
         chunk = client.recv(4096)
@@ -359,6 +418,7 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
     return data
 
 def http_client(client: socket.socket, first_byte: bytes) -> None:
+    """处理普通的 HTTP 代理请求 (注意：我们只给 SOCKS5 加了密码，HTTP代理暂不支持密码)"""
     upstream = None
     try:
         header = read_http_header(client, first_byte)
@@ -398,6 +458,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
             upstream.close()
 
 def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+    """接收连接，根据客户端发送的第一个字节判断是 SOCKS5 还是 HTTP 代理"""
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
@@ -415,6 +476,7 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
             pass
 
 def start_proxy_server(host: str, port: int) -> None:
+    """启动代理服务器监听进程"""
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     try:
