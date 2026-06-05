@@ -116,6 +116,11 @@ last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
 last_pinger_heartbeat = 0.0
 server_start_time = time.time()
+auto_switch_fetch_in_progress = False
+auto_switch_last_fetch_at = 0.0
+auto_switch_last_no_candidate_log = 0.0
+AUTO_SWITCH_FETCH_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SWITCH_FETCH_COOLDOWN_SECONDS", "60"))
+AUTO_SWITCH_NO_CANDIDATE_LOG_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SWITCH_NO_CANDIDATE_LOG_COOLDOWN_SECONDS", "30"))
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -183,6 +188,7 @@ def load_ui_config() -> dict[str, Any]:
             "routing_mode": "auto",
             "force_country": "",
             "routing_ip_type": "all",
+            "routing_protocol": ["udp"],
             "connection_enabled": True,
             "fixed_node_id": ""
         }
@@ -192,7 +198,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["proxy_port", "proxy_user", "proxy_pass", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id"]:
+                for key in ["proxy_port", "proxy_user", "proxy_pass", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "connection_enabled", "fixed_node_id"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -306,11 +312,12 @@ def get_state() -> dict[str, Any]:
     state["port"] = ui_cfg.get("port", 8787)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
-    state["proxy_user"] = ui_cfg.get("proxy_user", "") # 新增这一行
-    state["proxy_pass"] = ui_cfg.get("proxy_pass", "") # 新增这一行
+    state["proxy_user"] = ui_cfg.get("proxy_user", "")
+    state["proxy_pass"] = ui_cfg.get("proxy_pass", "")
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
+    state["routing_protocol"] = normalize_routing_protocols(ui_cfg.get("routing_protocol", ["udp"]))
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     
@@ -325,6 +332,41 @@ def parse_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+def normalize_protocol_name(value: Any) -> str:
+    proto = str(value or "").strip().lower()
+    if proto.startswith("tcp"):
+        return "tcp"
+    if proto == "udp":
+        return "udp"
+    return ""
+
+def normalize_routing_protocols(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        text = str(value or "").strip().lower()
+        legacy_map = {
+            "all": ["tcp", "udp"],
+            "tcp_only": ["tcp"],
+            "udp_only": ["udp"],
+        }
+        if text in legacy_map:
+            return legacy_map[text]
+        raw_items = re.split(r"[\s,;|/]+", text) if text else []
+    protocols: list[str] = []
+    for item in raw_items:
+        proto = normalize_protocol_name(item)
+        if proto and proto not in protocols:
+            protocols.append(proto)
+    return protocols or ["udp"]
+
+def node_protocol(node: dict[str, Any]) -> str:
+    return normalize_protocol_name(node.get("proto"))
+
+def apply_protocol_filter(nodes: list[dict[str, Any]], routing_protocols: Any) -> list[dict[str, Any]]:
+    allowed = set(normalize_routing_protocols(routing_protocols))
+    return [n for n in nodes if node_protocol(n) in allowed]
 
 def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_ssl_verify: bool = True) -> str:
     import socket
@@ -545,7 +587,7 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
 def fetch_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
-    seen_ips = set()
+    seen_endpoints = set()
     
     # 检查本地是否有节点缓存，以确定最大重试尝试次数
     has_cache = len(cached_nodes()) > 0
@@ -574,15 +616,22 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 rows = parse_vpngate_rows(api_text)
                 for row in rows[:MAX_SCAN_ROWS]:
                     ip = row.get("IP", "")
-                    if not ip or ip in seen_ips:
+                    if not ip:
                         continue
                     encoded = row.get("OpenVPN_ConfigData_Base64", "")
                     if not encoded:
                         continue
                     config_text = decode_config(encoded)
                     node = row_to_node(row, config_text)
+                    endpoint_key = (
+                        str(node.get("ip") or ""),
+                        str(node.get("remote_port") or ""),
+                        node_protocol(node),
+                    )
+                    if endpoint_key in seen_endpoints:
+                        continue
                     candidates.append(node)
-                    seen_ips.add(ip)
+                    seen_endpoints.add(endpoint_key)
                 if candidates:
                     break
             except Exception as e:
@@ -1083,6 +1132,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     return list(updated_nodes_map.values())
 
 def auto_switch_node(attempt: int = 0) -> None:
+    global auto_switch_fetch_in_progress, auto_switch_last_fetch_at, auto_switch_last_no_candidate_log
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
         return
@@ -1118,6 +1168,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             candidates = [n for n in candidates if n.get("ip_type") in ("residential", "mobile")]
         elif routing_ip_type == "hosting":
             candidates = [n for n in candidates if n.get("ip_type") == "hosting"]
+        candidates = apply_protocol_filter(candidates, ui_cfg.get("routing_protocol", ["udp"]))
             
         candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
         
@@ -1137,8 +1188,15 @@ def auto_switch_node(attempt: int = 0) -> None:
         msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
         if routing_mode == "fixed_region" and target_country:
             msg = f"没有可用的【{target_country}】备选节点，已断开连接，将在后台持续尝试获取新节点..."
-        print(f"[自动切换] {msg}", flush=True)
-        log_to_json("WARNING", "VPN", msg)
+        now = time.time()
+        should_log = False
+        with lock:
+            if now - auto_switch_last_no_candidate_log >= AUTO_SWITCH_NO_CANDIDATE_LOG_COOLDOWN_SECONDS:
+                auto_switch_last_no_candidate_log = now
+                should_log = True
+        if should_log:
+            print(f"[自动切换] {msg}", flush=True)
+            log_to_json("WARNING", "VPN", msg)
         stop_active_openvpn()
         with lock:
             nodes = read_json(NODES_FILE, [])
@@ -1146,13 +1204,24 @@ def auto_switch_node(attempt: int = 0) -> None:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
         set_state(active_openvpn_node_id="", last_check_message=msg)
-        
+
+        with lock:
+            if auto_switch_fetch_in_progress:
+                return
+            if now - auto_switch_last_fetch_at < AUTO_SWITCH_FETCH_COOLDOWN_SECONDS:
+                return
+            auto_switch_fetch_in_progress = True
+            auto_switch_last_fetch_at = now
+
         def bg_fetch_and_switch():
+            global auto_switch_fetch_in_progress
             try:
                 maintain_valid_nodes(force=False)
-                auto_switch_node()
             except Exception as e:
                 print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
+            finally:
+                with lock:
+                    auto_switch_fetch_in_progress = False
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
@@ -1182,6 +1251,9 @@ def connect_node(node_id: str) -> str:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
+        allowed_protocols = set(normalize_routing_protocols(ui_cfg.get("routing_protocol", ["udp"])))
+        if node_protocol(node) not in allowed_protocols:
+            raise ValueError(f"当前协议筛选不允许连接该节点: {node_id}")
         
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
         stop_active_openvpn()
@@ -1387,6 +1459,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             available_candidates = [n for n in available_candidates if n.get("ip_type") in ("residential", "mobile")]
                         elif routing_ip_type == "hosting":
                             available_candidates = [n for n in available_candidates if n.get("ip_type") == "hosting"]
+                        available_candidates = apply_protocol_filter(available_candidates, ui_cfg.get("routing_protocol", ["udp"]))
                         
                         if available_candidates:
                             auto_switch_node()
@@ -2601,6 +2674,17 @@ INDEX_HTML = r"""<!doctype html>
         <option value="hosting">仅机房IP</option>
       </select>
     </div>
+    <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
+      <span style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">协议:</span>
+      <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: var(--text-primary);">
+        <input type="checkbox" id="header_protocol_tcp" value="tcp" style="accent-color: #22c55e;">
+        <span>TCP</span>
+      </label>
+      <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: var(--text-primary);">
+        <input type="checkbox" id="header_protocol_udp" value="udp" style="accent-color: #22c55e;">
+        <span>UDP</span>
+      </label>
+    </div>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -3031,6 +3115,13 @@ const translateIpType = t => {
   return dict[t] || t || "-";
 };
 
+const translateProtocol = p => {
+  const proto = (p || "").toLowerCase();
+  if (proto.startsWith("tcp")) return "TCP";
+  if (proto === "udp") return "UDP";
+  return proto ? proto.toUpperCase() : "-";
+};
+
 const translateCountry = c => {
   const dict = {
     "Japan": "日本",
@@ -3254,6 +3345,7 @@ function render(){
             <div class="active-card-meta" style="margin-top: 4px;">
               <span>物理位置: <strong>${esc(displayLocation)}</strong></span>
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
+              <span style="margin-left: 12px;">协议: <strong>${esc(translateProtocol(activeNode.proto))}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
             </div>
@@ -3374,16 +3466,20 @@ function render(){
       const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
-      // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
+      // Connect button is disabled if probe status is "unavailable", protocol is filtered out, or if we are already connecting
       const isUnavailable = n.probe_status === "unavailable";
+      const enabledProtocols = Array.isArray(state.routing_protocol) ? state.routing_protocol : [];
+      const protocolAllowed = enabledProtocols.includes((n.proto || "").toLowerCase().startsWith("tcp") ? "tcp" : ((n.proto || "").toLowerCase() === "udp" ? "udp" : ""));
+      const connectDisabled = isUnavailable || state.is_connecting || !protocolAllowed;
+      const connectDisabledReason = !protocolAllowed ? "当前协议筛选未允许该节点" : (isUnavailable ? "当前节点不可用" : "");
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+        : `<button class="connect-btn" ${connectDisabled ? `disabled style="opacity:0.3; cursor:not-allowed;" title="${esc(connectDisabledReason)}"` : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td>${latencyText}</td>
-        <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}<div style="margin-top:4px; font-size:11px; color:var(--text-secondary);">${esc(translateProtocol(n.proto))}</div></td>
         <td>${esc(displayLocation)}</td>
         <td class="mono" style="font-size:12px; color:var(--text-secondary);">${esc(n.asn||"-")}</td>
         <td>${esc(n.owner||n.as_name||"-")}</td>
@@ -3648,7 +3744,9 @@ $("btn_batch_test_all").onclick = async () => {
 function updateHeaderRoutingControls() {
   const selectCountry = $("header_routing_country");
   const selectIpType = $("header_routing_ip_type");
-  if (!selectCountry || !selectIpType) return;
+  const protocolTcp = $("header_protocol_tcp");
+  const protocolUdp = $("header_protocol_udp");
+  if (!selectCountry || !selectIpType || !protocolTcp || !protocolUdp) return;
   
   // 1. Countries list
   const countMap = getCountryCountMap();
@@ -3690,11 +3788,16 @@ function updateHeaderRoutingControls() {
   }
   
   selectIpType.value = state.routing_ip_type || "all";
+  const enabledProtocols = Array.isArray(state.routing_protocol) ? state.routing_protocol : [];
+  protocolTcp.checked = enabledProtocols.includes("tcp");
+  protocolUdp.checked = enabledProtocols.includes("udp");
 }
 
 async function saveHeaderRouting() {
   const selectCountry = $("header_routing_country");
   const selectIpType = $("header_routing_ip_type");
+  const protocolTcp = $("header_protocol_tcp");
+  const protocolUdp = $("header_protocol_udp");
   
   let routingMode = "auto";
   let forceCountry = selectCountry.value;
@@ -3709,6 +3812,14 @@ async function saveHeaderRouting() {
   }
   
   const routingIpType = selectIpType.value;
+  const routingProtocol = [];
+  if (protocolTcp && protocolTcp.checked) routingProtocol.push("tcp");
+  if (protocolUdp && protocolUdp.checked) routingProtocol.push("udp");
+  if (routingProtocol.length === 0) {
+    alert("请至少勾选一种协议");
+    updateHeaderRoutingControls();
+    return;
+  }
   
   try {
     const response = await fetch("./api/update_routing", {
@@ -3717,7 +3828,8 @@ async function saveHeaderRouting() {
       body: JSON.stringify({
         routing_mode: routingMode,
         force_country: forceCountry,
-        routing_ip_type: routingIpType
+        routing_ip_type: routingIpType,
+        routing_protocol: routingProtocol
       })
     });
     const result = await response.json();
@@ -3752,6 +3864,8 @@ $("country_filter").onchange=()=>{ currentPage = 1; render(); };
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("header_routing_country").onchange = saveHeaderRouting;
 $("header_routing_ip_type").onchange = saveHeaderRouting;
+$("header_protocol_tcp").onchange = saveHeaderRouting;
+$("header_protocol_udp").onchange = saveHeaderRouting;
 
 $("refresh").onclick=async()=>{ 
   $("refresh").disabled=true; 
@@ -4913,6 +5027,7 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                routing_protocol = normalize_routing_protocols(payload.get("routing_protocol", ["udp"]))
                 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
@@ -4920,11 +5035,15 @@ class Handler(BaseHTTPRequestHandler):
                 if routing_ip_type not in ("all", "residential", "hosting"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
                     return
+                if not routing_protocol:
+                    self.send_json({"ok": False, "error": "请至少选择一种协议"}, HTTPStatus.BAD_REQUEST)
+                    return
                 
                 ui_cfg = load_ui_config()
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                ui_cfg["routing_protocol"] = routing_protocol
                 ui_cfg.pop("enable_force_country", None)
                 
                 auth_file = DATA_DIR / "ui_auth.json"
