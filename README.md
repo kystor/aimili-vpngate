@@ -23,7 +23,7 @@ AimiliVPN 是一款基于官方 VPNGate 开放协议的高性能、零依赖 VPN
 
 #### 🌟 正式稳定版本 (main 分支)
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/kystor/aimili-vpngate/refs/heads/main/install.sh)
 ```
 
 #### 🧪 测试开发版本 (bate 分支)
