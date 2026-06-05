@@ -47,14 +47,41 @@ echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="baoweise-bot"
+# Priority:
+#   1) command line args: bash install.sh <github_user> <github_repo>
+#   2) existing installation remote origin
+#   3) current repository defaults
+DEFAULT_USER="kystor"
 DEFAULT_REPO="aimili-vpngate"
+INSTALL_DIR="/opt/aimilivpn"
 
-# Allow custom repository override via command line arguments
-GITHUB_USER="${1:-${DEFAULT_USER}}"
-GITHUB_REPO="${2:-${DEFAULT_REPO}}"
+parse_github_repo_from_url() {
+    local remote_url="$1"
+    remote_url="${remote_url%.git}"
+    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/]+)$ ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
 
+GITHUB_USER="${1:-}"
+GITHUB_REPO="${2:-}"
+
+if [ -z "$GITHUB_USER" ] || [ -z "$GITHUB_REPO" ]; then
+    if [ -d "${INSTALL_DIR}/.git" ]; then
+        EXISTING_REMOTE_URL=$(git -C "${INSTALL_DIR}" config --get remote.origin.url 2>/dev/null || true)
+        if [ -n "$EXISTING_REMOTE_URL" ]; then
+            if parsed_repo=$(parse_github_repo_from_url "$EXISTING_REMOTE_URL"); then
+                GITHUB_USER="${GITHUB_USER:-$(echo "$parsed_repo" | awk '{print $1}')}"
+                GITHUB_REPO="${GITHUB_REPO:-$(echo "$parsed_repo" | awk '{print $2}')}"
+            fi
+        fi
+    fi
+fi
+
+GITHUB_USER="${GITHUB_USER:-${DEFAULT_USER}}"
+GITHUB_REPO="${GITHUB_REPO:-${DEFAULT_REPO}}"
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
 echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
@@ -81,7 +108,6 @@ elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
 fi
 
 # 4. Clone or pull the repository
-INSTALL_DIR="/opt/aimilivpn"
 # 默认部署分支（在 bate 分支设为 bate；在 main 分支设为 main）
 DEFAULT_DEPLOY_BRANCH="main"
 
