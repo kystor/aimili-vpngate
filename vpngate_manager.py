@@ -175,6 +175,9 @@ def load_ui_config() -> dict[str, Any]:
             "password": "",
             "host": "::",
             "port": 8787,
+            "proxy_port": 7928,
+            "proxy_user": "",
+            "proxy_pass": "",
             "routing_mode": "auto",
             "force_country": "",
             "routing_ip_type": "all",
@@ -187,7 +190,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id"]:
+                for key in ["proxy_port", "proxy_user", "proxy_pass", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -3006,7 +3009,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
-const pageSize = 99999;
+const pageSize = 15;
 let currentPageNodes = [];
 
 const $=id=>document.getElementById(id);
@@ -3170,8 +3173,29 @@ function getFilteredNodes() {
 function stableSortNodes() {
   nodes.sort((a, b) => {
     if (!a || !b) return 0;
-    const aScore = a.score || 0;
-    const bScore = b.score || 0;
+    const getStatusRank = node => {
+      if (node.active) return 0;
+      if (node.probe_status === "available") return 1;
+      if (node.probe_status === "not_checked") return 2;
+      if (node.probe_status === "unavailable") return 3;
+      return 4;
+    };
+    const getLatency = node => {
+      const latency = Number.parseInt(node.latency_ms, 10);
+      return Number.isFinite(latency) && latency >= 0 ? latency : 999999;
+    };
+    const aStatusRank = getStatusRank(a);
+    const bStatusRank = getStatusRank(b);
+    if (aStatusRank !== bStatusRank) {
+      return aStatusRank - bStatusRank;
+    }
+    const aLatency = getLatency(a);
+    const bLatency = getLatency(b);
+    if (aLatency !== bLatency) {
+      return aLatency - bLatency;
+    }
+    const aScore = Number.parseInt(a.score, 10) || 0;
+    const bScore = Number.parseInt(b.score, 10) || 0;
     if (bScore !== aScore) {
       return bScore - aScore;
     }
