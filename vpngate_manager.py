@@ -107,8 +107,10 @@ active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
 is_connecting = True
+proxy_health_failures = 0
 last_active_ping_time = 0.0
 last_active_latency = 0
+PROXY_HEALTH_FAILURE_THRESHOLD = 3
 
 last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
@@ -1155,7 +1157,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
 def connect_node(node_id: str) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting
+    global active_openvpn_process, active_openvpn_node_id, is_connecting, proxy_health_failures
     with lock:
         if is_connecting:
             print("[连接] 正在建立其他连接中，跳过此请求", flush=True)
@@ -1244,6 +1246,7 @@ def connect_node(node_id: str) -> str:
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
         res = check_proxy_health()
         if res["ok"]:
+            proxy_health_failures = 0
             set_state(
                 proxy_ok=True,
                 proxy_ip=res["ip"],
@@ -4325,6 +4328,10 @@ def check_proxy_health() -> dict[str, Any]:
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
+    ui_cfg = load_ui_config()
+    proxy_user = str(ui_cfg.get("proxy_user") or "").strip()
+    proxy_pass = str(ui_cfg.get("proxy_pass") or "").strip()
+
     def _curl_check_ip(url: str) -> dict[str, Any] | None:
         proxy_hosts = []
         if LOCAL_PROXY_HOST == "::":
@@ -4345,6 +4352,8 @@ def check_proxy_health() -> dict[str, Any]:
                 url,
                 "--max-time", "5"
             ]
+            if proxy_user and proxy_pass:
+                cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
                 if res.returncode == 0:
@@ -4362,12 +4371,15 @@ def check_proxy_health() -> dict[str, Any]:
         return None
 
     try:
-        result = _curl_check_ip("http://ip.sb")
-        if result:
-            return result
-        result = _curl_check_ip("http://api.ipify.org")
-        if result:
-            return result
+        for test_url in [
+            "https://api.ipify.org",
+            "https://ip.sb",
+            "http://api.ipify.org",
+            "http://ip.sb",
+        ]:
+            result = _curl_check_ip(test_url)
+            if result:
+                return result
             
         # 此时外网测试失败，检测本地代理端口是否依然能连通。若仍能连通，直接抛出出口测试失败，不调用占用诊断
         port_still_listening = False
@@ -4407,7 +4419,7 @@ def check_proxy_health() -> dict[str, Any]:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
 
 def background_proxy_checker() -> None:
-    global last_checker_heartbeat, is_connecting
+    global last_checker_heartbeat, is_connecting, proxy_health_failures
     time.sleep(30)
     while True:
         last_checker_heartbeat = time.time()
@@ -4418,6 +4430,7 @@ def background_proxy_checker() -> None:
 
             res = check_proxy_health()
             if res["ok"]:
+                proxy_health_failures = 0
                 set_state(
                     proxy_ok=True,
                     proxy_ip=res["ip"],
@@ -4427,9 +4440,10 @@ def background_proxy_checker() -> None:
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 error_msg = res.get("error", "未知错误")
+                proxy_health_failures += 1
                 if active_openvpn_node_id:
                     print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理当前不可用！原因: {error_msg}", flush=True)
-                    log_to_json("WARNING", "Proxy", f"代理不可用: {error_msg}")
+                    log_to_json("WARNING", "Proxy", f"代理不可用 (连续失败 {proxy_health_failures}/{PROXY_HEALTH_FAILURE_THRESHOLD}): {error_msg}")
                 set_state(
                     proxy_ok=False,
                     proxy_ip="-",
@@ -4438,7 +4452,7 @@ def background_proxy_checker() -> None:
                 )
 
                 # If we intended to have an active VPN node but proxy failed, trigger auto-switch
-                if active_openvpn_node_id:
+                if active_openvpn_node_id and proxy_health_failures >= PROXY_HEALTH_FAILURE_THRESHOLD:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
