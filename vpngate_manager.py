@@ -78,12 +78,16 @@ import vpn_utils
 import proxy_server
 
 API_URL = "https://www.vpngate.net/api/iphone/"
+MIRROR_SITES_URL = os.environ.get("MIRROR_SITES_URL", "https://www.vpngate.net/en/sites.aspx")
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "1260"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1260"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
 # 【优化】将默认单次从 API 扫描的最大节点数量从 300 提升到 2000
 # 这样可以一次性把官方 API 接口返回的所有可用节点全部吃进内存
 MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "2000"))
+ENABLE_MIRROR_AGGREGATION = str(os.environ.get("ENABLE_MIRROR_AGGREGATION", "1")).strip().lower() not in ("0", "false", "no", "off")
+MAX_MIRROR_SOURCES = int(os.environ.get("MAX_MIRROR_SOURCES", "8"))
+MIRROR_LIST_CACHE_SECONDS = int(os.environ.get("MIRROR_LIST_CACHE_SECONDS", "1800"))
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
@@ -121,6 +125,8 @@ auto_switch_last_fetch_at = 0.0
 auto_switch_last_no_candidate_log = 0.0
 AUTO_SWITCH_FETCH_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SWITCH_FETCH_COOLDOWN_SECONDS", "60"))
 AUTO_SWITCH_NO_CANDIDATE_LOG_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SWITCH_NO_CANDIDATE_LOG_COOLDOWN_SECONDS", "30"))
+mirror_api_urls_cache: list[str] = []
+mirror_api_urls_cache_expires_at = 0.0
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -368,6 +374,75 @@ def apply_protocol_filter(nodes: list[dict[str, Any]], routing_protocols: Any) -
     allowed = set(normalize_routing_protocols(routing_protocols))
     return [n for n in nodes if node_protocol(n) in allowed]
 
+def dedupe_keep_order(items: list[str]) -> list[str]:
+    result: list[str] = []
+    seen = set()
+    for item in items:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+def build_fetch_attempt_targets(url: str) -> list[tuple[str, bool]]:
+    attempts = [(url, True)]
+    if url.startswith("https://"):
+        attempts.append((url, False))
+        attempts.append((url.replace("https://", "http://", 1), True))
+    return attempts
+
+def is_vpngate_api_payload(text: str) -> bool:
+    sample = "\n".join(text.splitlines()[:6])
+    return "OpenVPN_ConfigData_Base64" in sample and "HostName,IP,Score" in sample
+
+def extract_mirror_page_urls(html: str) -> list[str]:
+    found = re.findall(r"""href=["'](https?://[^"'<>]+/en/)["']""", html, flags=re.IGNORECASE)
+    mirrors = dedupe_keep_order(found)
+    return mirrors[:MAX_MIRROR_SOURCES]
+
+def fetch_text_from_source(source_url: str, max_attempts: int, source_label: str, expect_api_payload: bool = False) -> tuple[str, str]:
+    last_err = None
+    for url, verify_ssl in build_fetch_attempt_targets(source_url):
+        for attempt_index in range(max_attempts):
+            if attempt_index > 0:
+                time.sleep(1.5)
+            try:
+                msg = f"尝试拉取 {source_label}: {url} (SSL验证: {verify_ssl}, 第 {attempt_index + 1} 次尝试)..."
+                print(f"[fetch_candidates] {msg}", flush=True)
+                log_to_json("INFO", "Main", msg)
+                text = fetch_api_text(url, verify_ssl)
+                if expect_api_payload and not is_vpngate_api_payload(text):
+                    raise ValueError("返回内容不是 VPNGate API 数据")
+                return text, url
+            except Exception as exc:
+                last_err = exc
+                warn_msg = f"拉取失败 ({source_label}, URL: {url}, 验证: {verify_ssl}): {exc}"
+                print(f"[fetch_candidates] {warn_msg}", flush=True)
+                log_to_json("WARNING", "Main", warn_msg)
+    if last_err:
+        raise RuntimeError(f"{source_label} 拉取失败: {last_err}") from last_err
+    raise RuntimeError(f"{source_label} 拉取失败")
+
+def fetch_vpngate_rows_from_source(source_url: str, max_attempts: int, source_label: str) -> tuple[list[dict[str, str]], str]:
+    api_text, fetched_from = fetch_text_from_source(source_url, max_attempts, source_label, expect_api_payload=True)
+    return parse_vpngate_rows(api_text), fetched_from
+
+def fetch_mirror_api_urls(force_refresh: bool = False) -> list[str]:
+    global mirror_api_urls_cache, mirror_api_urls_cache_expires_at
+    now = time.time()
+    with lock:
+        if not force_refresh and mirror_api_urls_cache and now < mirror_api_urls_cache_expires_at:
+            return list(mirror_api_urls_cache)
+    html, fetched_from = fetch_text_from_source(MIRROR_SITES_URL, 1, "镜像列表页")
+    print(f"[fetch_candidates] 镜像列表页获取成功: {fetched_from}", flush=True)
+    mirrors = extract_mirror_page_urls(html)
+    api_urls = dedupe_keep_order([urllib.parse.urljoin(url, "../api/iphone/") for url in mirrors if url])
+    with lock:
+        mirror_api_urls_cache = api_urls
+        mirror_api_urls_cache_expires_at = now + MIRROR_LIST_CACHE_SECONDS
+    return list(api_urls)
+
 def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_ssl_verify: bool = True) -> str:
     import socket
     import ssl
@@ -588,58 +663,66 @@ def fetch_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_endpoints = set()
+    source_summaries: list[str] = []
     
     # 检查本地是否有节点缓存，以确定最大重试尝试次数
     has_cache = len(cached_nodes()) > 0
     max_attempts = 1 if has_cache else 2
-    
-    # 尝试 URLs 队列: 1. HTTPS(验证证书) 2. HTTPS(不验证证书) 3. HTTP
-    attempts_targets = [
-        (API_URL, True),
-        (API_URL, False)
-    ]
-    if API_URL.startswith("https://"):
-        attempts_targets.append((API_URL.replace("https://", "http://"), True))
-        
-    log_to_json("INFO", "Main", "开始拉取官方 API 节点列表...")
-    
+
+    source_urls = [API_URL]
+    if ENABLE_MIRROR_AGGREGATION:
+        try:
+            mirror_api_urls = fetch_mirror_api_urls()
+            if mirror_api_urls:
+                source_urls.extend(mirror_api_urls)
+                log_to_json("INFO", "Main", f"已加载 {len(mirror_api_urls)} 个镜像 API 源")
+            else:
+                log_to_json("WARNING", "Main", "镜像列表页可访问，但未解析出可用镜像 API 源")
+        except Exception as exc:
+            print(f"[fetch_candidates] 获取镜像列表失败: {exc}", flush=True)
+            log_to_json("WARNING", "Main", f"获取镜像列表失败: {exc}")
+    source_urls = dedupe_keep_order(source_urls)
+
+    log_to_json("INFO", "Main", f"开始拉取 VPNGate 节点列表，数据源数量: {len(source_urls)}")
+
     last_err = None
-    for url, verify_ssl in attempts_targets:
-        for i in range(max_attempts):
-            if i > 0:
-                time.sleep(1.5)
-            try:
-                msg = f"尝试拉取 {url} (SSL验证: {verify_ssl}, 第 {i+1} 次尝试)..."
-                print(f"[fetch_candidates] {msg}", flush=True)
-                log_to_json("INFO", "Main", msg)
-                api_text = fetch_api_text(url, verify_ssl)
-                rows = parse_vpngate_rows(api_text)
-                for row in rows[:MAX_SCAN_ROWS]:
-                    ip = row.get("IP", "")
-                    if not ip:
-                        continue
-                    encoded = row.get("OpenVPN_ConfigData_Base64", "")
-                    if not encoded:
-                        continue
-                    config_text = decode_config(encoded)
-                    node = row_to_node(row, config_text)
-                    endpoint_key = (
-                        str(node.get("ip") or ""),
-                        str(node.get("remote_port") or ""),
-                        node_protocol(node),
-                    )
-                    if endpoint_key in seen_endpoints:
-                        continue
-                    candidates.append(node)
-                    seen_endpoints.add(endpoint_key)
-                if candidates:
-                    break
-            except Exception as e:
-                last_err = e
-                print(f"[fetch_candidates] 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
-                log_to_json("WARNING", "Main", f"拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
-        if candidates:
-            break
+    for index, source_url in enumerate(source_urls):
+        source_label = "官方主站" if index == 0 else f"镜像源#{index}"
+        source_attempts = max_attempts if index == 0 else 1
+        try:
+            rows, fetched_from = fetch_vpngate_rows_from_source(source_url, source_attempts, source_label)
+            before_count = len(candidates)
+            scanned_rows = 0
+            for row in rows[:MAX_SCAN_ROWS]:
+                scanned_rows += 1
+                ip = row.get("IP", "")
+                if not ip:
+                    continue
+                encoded = row.get("OpenVPN_ConfigData_Base64", "")
+                if not encoded:
+                    continue
+                config_text = decode_config(encoded)
+                node = row_to_node(row, config_text)
+                endpoint_key = (
+                    str(node.get("ip") or ""),
+                    str(node.get("remote_port") or ""),
+                    node_protocol(node),
+                )
+                if endpoint_key in seen_endpoints:
+                    continue
+                candidates.append(node)
+                seen_endpoints.add(endpoint_key)
+            added_count = len(candidates) - before_count
+            summary = f"{source_label}({fetched_from}) rows={len(rows)} scanned={scanned_rows} added={added_count}"
+            source_summaries.append(summary)
+            print(f"[fetch_candidates] {summary}", flush=True)
+            log_to_json("INFO", "Main", summary)
+        except Exception as exc:
+            last_err = exc
+            fail_summary = f"{source_label}({source_url}) failed: {exc}"
+            source_summaries.append(fail_summary)
+            print(f"[fetch_candidates] {fail_summary}", flush=True)
+            log_to_json("WARNING", "Main", fail_summary)
             
     if not candidates:
         err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
@@ -659,10 +742,10 @@ def fetch_candidates() -> list[dict[str, Any]]:
     set_state(
         last_fetch_at=time.time(),
         last_fetch_status="ok",
-        last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
+        last_fetch_message=f"已聚合 {len(source_urls)} 个源，得到 {len(candidates)} 个唯一候选节点。来源: {' | '.join(source_summaries[:6])}",
         blacklisted_nodes=len(blacklist),
     )
-    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
+    log_to_json("INFO", "Main", f"成功聚合 {len(source_urls)} 个源，共 {len(candidates)} 个唯一候选节点")
     return candidates
 
 def cached_nodes() -> list[dict[str, Any]]:
