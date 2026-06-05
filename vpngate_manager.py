@@ -3326,6 +3326,7 @@ function getFilteredNodes() {
   const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
   const selectedIpType = $("ip_type_filter").value;
+  const enabledProtocols = Array.isArray(state.routing_protocol) ? state.routing_protocol : [];
   return nodes.filter(n => {
     if (!n) return false;
     if (selectedCountry && n.country !== selectedCountry) {
@@ -3338,6 +3339,12 @@ function getFilteredNodes() {
       if (selectedIpType === "hosting" && n.ip_type !== "hosting") {
         return false;
       }
+    }
+    const nodeProtocol = (n.proto || "").toLowerCase().startsWith("tcp")
+      ? "tcp"
+      : ((n.proto || "").toLowerCase() === "udp" ? "udp" : "");
+    if (enabledProtocols.length > 0 && !enabledProtocols.includes(nodeProtocol)) {
+      return false;
     }
     const searchStr = [
       n.country || "", n.country_short || "", n.ip || "", n.remote_host || "", n.proto || "",
