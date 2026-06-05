@@ -234,7 +234,15 @@ def generate_random_suffix():
 def load_ui_cfg():
     import json
     path = "/opt/aimilivpn/vpngate_data/ui_auth.json"
-    cfg = {"host": "::", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": ""}
+    cfg = {
+        "host": "::",
+        "port": 8787,
+        "secret_path": "EJsW2EeBo9lY",
+        "password": "",
+        "proxy_port": 7928,
+        "proxy_user": "",
+        "proxy_pass": ""
+    }
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -982,11 +990,14 @@ AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 mkdir -p "${INSTALL_DIR}/vpngate_data"
 
 if [ ! -f "$AUTH_FILE" ]; then
-    echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码）？${PLAIN}"
+    echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码/代理端口/SOCKS5 账号密码）？${PLAIN}"
     read -p "是否自定义配置？[y/N]: " is_custom
     
     # Initialize defaults
     UI_PORT=8787
+    PROXY_PORT=7928
+    PROXY_USER=""
+    PROXY_PASS=""
     # generate random secret suffix (12 chars alphanumeric)
     SECRET_PATH=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")
     # generate random password
@@ -1058,6 +1069,31 @@ while True:
                 echo -e "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"
             fi
         done
+
+        # 4. Custom proxy port
+        while true; do
+            read -p "请输入 HTTP/SOCKS5 代理端口 [1024-65535, 默认 7928]: " input_proxy_port
+            if [ -z "$input_proxy_port" ]; then
+                PROXY_PORT=7928
+                break
+            fi
+            if [[ "$input_proxy_port" =~ ^[0-9]+$ ]] && [ "$input_proxy_port" -ge 1024 ] && [ "$input_proxy_port" -le 65535 ]; then
+                if [ "$input_proxy_port" -eq "$UI_PORT" ]; then
+                    echo -e "${RED}输入错误: 代理端口不能与网页管理端口相同！${PLAIN}"
+                else
+                    PROXY_PORT=$input_proxy_port
+                    break
+                fi
+            else
+                echo -e "${RED}输入错误: 代理端口必须是 1024 到 65535 之间的数字！${PLAIN}"
+            fi
+        done
+
+        # 5. Custom SOCKS5 credentials
+        read -p "请输入 SOCKS5 代理账号 [留空则不启用认证]: " input_proxy_user
+        PROXY_USER="$input_proxy_user"
+        read -p "请输入 SOCKS5 代理密码 [留空则不启用认证]: " input_proxy_pass
+        PROXY_PASS="$input_proxy_pass"
     fi
 
     # Write config JSON
@@ -1066,6 +1102,9 @@ import json
 cfg = {
     'host': '::',
     'port': int('$UI_PORT'),
+    'proxy_port': int('$PROXY_PORT'),
+    'proxy_user': '$PROXY_USER',
+    'proxy_pass': '$PROXY_PASS',
     'secret_path': '$SECRET_PATH',
     'username': '$UI_USERNAME',
     'password': '$UI_PASSWORD'
@@ -1152,12 +1191,14 @@ SECRET_PATH="EJsW2EeBo9lY"
 USERNAME="未配置"
 PASSWORD="未配置"
 UI_PORT=8787
+PROXY_PORT=7928
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 if [ -f "$AUTH_FILE" ]; then
     SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
     USERNAME=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
     PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
     UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
+    PROXY_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_port', 7928))" 2>/dev/null || echo "7928")
 fi
 
 # Get VPS public IP
@@ -1178,7 +1219,7 @@ if [ -n "$PUBLIC_IPV6" ]; then
 fi
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
-echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}  或  ${BLUE}http://[::1]:7928/${PLAIN}"
+echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${PLAIN}  或  ${BLUE}http://[::1]:${PROXY_PORT}/${PLAIN}"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
