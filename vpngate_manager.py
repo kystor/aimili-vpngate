@@ -121,6 +121,8 @@ proxy_health_failures = 0
 last_active_ping_time = 0.0
 last_active_latency = 0
 PROXY_HEALTH_FAILURE_THRESHOLD = 3
+PROXY_HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
+PROXY_HEALTH_FAILURE_RECHECK_INTERVAL_SECONDS = int(os.environ.get("PROXY_HEALTH_FAILURE_RECHECK_INTERVAL_SECONDS", "10"))
 
 last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
@@ -3895,33 +3897,38 @@ async function runNodeTestBatches(ids, options = {}) {
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 }
 
-let pollInterval = null;
+let statePollTimer = null;
+let statePollInFlight = false;
 
-function startConnectionPolling() {
-  if (pollInterval) clearInterval(pollInterval);
-  pollInterval = setInterval(async () => {
-    try {
-      const resp = await fetch("./api/nodes");
-      const data = await resp.json();
-      nodes = data.nodes || [];
-      state = data.state || {};
-      stableSortNodes();
-      render();
-      
-      if (!state.is_connecting) {
-        clearInterval(pollInterval);
-        pollInterval = null;
-        try {
-          await fetch("./api/test_proxy", { method: "POST" });
-        } catch(pe){}
-        load();
-      }
-    } catch(pe) {
-      clearInterval(pollInterval);
-      pollInterval = null;
-      load();
+async function syncNodesState() {
+  if (statePollInFlight) return;
+  statePollInFlight = true;
+  try {
+    const resp = await fetch("./api/nodes");
+    const data = await resp.json();
+    nodes = data.nodes || [];
+    state = data.state || {};
+    stableSortNodes();
+    updateCountryFilter();
+    updateHeaderRoutingControls();
+    render();
+  } catch (e) {
+    console.error("syncNodesState failed", e);
+  } finally {
+    statePollInFlight = false;
+  }
+}
+
+function startStatePolling() {
+  if (statePollTimer) clearInterval(statePollTimer);
+  let currentInterval = state.is_connecting ? 1000 : 3000;
+  statePollTimer = setInterval(async () => {
+    await syncNodesState();
+    const nextInterval = state.is_connecting ? 1000 : 3000;
+    if (nextInterval !== currentInterval) {
+      startStatePolling();
     }
-  }, 1000);
+  }, currentInterval);
 }
 
 async function connectNode(id){
@@ -3931,7 +3938,7 @@ async function connectNode(id){
   state.last_check_message = "正在发送连接请求...";
   render();
   
-  startConnectionPolling();
+  startStatePolling();
   
   try {
     const r = await fetch("./api/connect",{
@@ -3942,20 +3949,12 @@ async function connectNode(id){
     const result = await r.json();
     if (!result.ok) {
       alert("连接失败: " + (result.error || "未知错误"));
-      if (pollInterval) {
-        clearInterval(pollInterval);
-        pollInterval = null;
-      }
       state.is_connecting = false;
       render();
       return;
     }
   } catch(e) {
     alert("连接请求错误");
-    if (pollInterval) {
-      clearInterval(pollInterval);
-      pollInterval = null;
-    }
     state.is_connecting = false;
     render();
   }
@@ -4145,19 +4144,8 @@ async function saveHeaderRouting() {
 }
 
 async function load(){
-  const r=await fetch("./api/nodes"); 
-  const d=await r.json(); 
-  nodes=d.nodes||[]; 
-  state=d.state||{}; 
-  
-  stableSortNodes();
-  updateCountryFilter();
-  updateHeaderRoutingControls();
-  render();
-
-  if (state.is_connecting) {
-    startConnectionPolling();
-  }
+  await syncNodesState();
+  startStatePolling();
 }
 
 function handleListProtocolFilterChange(event) {
@@ -4850,7 +4838,7 @@ def check_proxy_health() -> dict[str, Any]:
 
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting, proxy_health_failures
-    time.sleep(30)
+    time.sleep(PROXY_HEALTH_CHECK_INTERVAL_SECONDS)
     while True:
         last_checker_heartbeat = time.time()
         try:
@@ -4904,7 +4892,8 @@ def background_proxy_checker() -> None:
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
-        time.sleep(30)
+        sleep_seconds = PROXY_HEALTH_FAILURE_RECHECK_INTERVAL_SECONDS if proxy_health_failures > 0 else PROXY_HEALTH_CHECK_INTERVAL_SECONDS
+        time.sleep(sleep_seconds)
 
 def active_node_pinger() -> None:
     global last_pinger_heartbeat
