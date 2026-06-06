@@ -2441,6 +2441,19 @@ INDEX_HTML = r"""<!doctype html>
       accent-color: #22c55e;
     }
 
+    .header-routing-select {
+      width: auto !important;
+      min-width: 0;
+      max-width: 22ch;
+      flex: 0 0 auto;
+      appearance: none;
+      -webkit-appearance: none;
+    }
+
+    .header-routing-select.is-country {
+      max-width: 18ch;
+    }
+
     .toolbar input {
       flex: 1;
       min-width: 250px;
@@ -2837,7 +2850,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="btn-group">
     <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
       <label for="header_routing_country" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">出站国家:</label>
-      <select id="header_routing_country" style="background: transparent; border: none; color: var(--text-primary); outline: none; cursor: pointer; font-size: 13px; font-weight: 600; padding: 0;">
+      <select id="header_routing_country" class="header-routing-select is-country" style="background: transparent; border: none; color: var(--text-primary); outline: none; cursor: pointer; font-size: 13px; font-weight: 600; padding: 0;">
         <option value="">智能路由 / 所有</option>
       </select>
     </div>
@@ -3440,19 +3453,30 @@ function updateCountryFilter() {
   const selectedValue = select.value;
   const countMap = getCountryCountMap(filterNodesForCountryCount());
   const countries = Object.keys(countMap).sort();
+  const preservedSelectedText = selectedValue
+    ? `${selectedValue} (0)`
+    : "";
   
   const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
   const currentTexts = Array.from(select.options).filter(o => o.value).map(o => o.textContent || "");
-  const nextTexts = countries.map(c => `${c} (${countMap[c]})`);
-  if (JSON.stringify(countries) === JSON.stringify(currentOptions) &&
+  const nextCountries = selectedValue && !countries.includes(selectedValue)
+    ? [selectedValue, ...countries]
+    : countries;
+  const nextTexts = nextCountries.map(c => c === selectedValue && !countMap[c] ? preservedSelectedText : `${c} (${countMap[c]})`);
+  if (JSON.stringify(nextCountries) === JSON.stringify(currentOptions) &&
       JSON.stringify(nextTexts) === JSON.stringify(currentTexts)) {
     return;
   }
   
   select.innerHTML = '<option value="">所有国家</option>' + 
-    countries.map(c => `<option value="${esc(c)}">${esc(c)} (${countMap[c]})</option>`).join("");
+    nextCountries.map(c => {
+      const label = c === selectedValue && !countMap[c]
+        ? preservedSelectedText
+        : `${c} (${countMap[c]})`;
+      return `<option value="${esc(c)}">${esc(label)}</option>`;
+    }).join("");
   
-  if (countries.includes(selectedValue)) {
+  if (selectedValue) {
     select.value = selectedValue;
   } else {
     select.value = "";
