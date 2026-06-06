@@ -2863,7 +2863,7 @@ INDEX_HTML = r"""<!doctype html>
       </select>
     </div>
     <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
-      <span style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">使用协议:</span>
+      <span style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">协议:</span>
       <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: var(--text-primary);">
         <input type="checkbox" id="header_protocol_tcp" value="tcp" style="accent-color: #22c55e;">
         <span>TCP</span>
@@ -3780,23 +3780,80 @@ async function testNode(btn, id, event){
   render();
   
   try {
-    const response = await fetch("./api/test_node", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id })
-    });
-    const result = await response.json();
-    if (result.ok && result.node) {
-      const idx = nodes.findIndex(n => n.id === id);
-      if (idx !== -1) {
-        nodes[idx] = result.node;
-      }
-    }
+    const updatedNodes = await requestNodeTests([id]);
+    applyUpdatedNodes(updatedNodes);
   } catch (e) {
   } finally {
     testingNodeIds.delete(id);
     render();
   }
+}
+
+function applyUpdatedNodes(updatedNodes) {
+  if (!Array.isArray(updatedNodes) || updatedNodes.length === 0) return false;
+  let changed = false;
+  updatedNodes.forEach(updatedNode => {
+    const idx = nodes.findIndex(item => item.id === updatedNode.id);
+    if (idx !== -1) {
+      nodes[idx] = updatedNode;
+      changed = true;
+    }
+  });
+  if (changed) {
+    stableSortNodes();
+  }
+  return changed;
+}
+
+async function requestNodeTests(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return [];
+  const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
+  if (uniqueIds.length === 0) return [];
+  const isSingle = uniqueIds.length === 1;
+  const response = await fetch(isSingle ? "./api/test_node" : "./api/test_nodes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(isSingle ? { id: uniqueIds[0] } : { ids: uniqueIds })
+  });
+  const result = await response.json();
+  if (!result.ok) {
+    throw new Error(result.error || "测速失败");
+  }
+  if (isSingle) {
+    return result.node ? [result.node] : [];
+  }
+  return Array.isArray(result.nodes) ? result.nodes : [];
+}
+
+async function runNodeTestBatches(ids, options = {}) {
+  const batchSize = options.batchSize || 20;
+  const requestConcurrency = options.requestConcurrency || 1;
+  const onBatchSettled = typeof options.onBatchSettled === "function" ? options.onBatchSettled : null;
+  const queue = [];
+  for (let i = 0; i < ids.length; i += batchSize) {
+    queue.push(ids.slice(i, i + batchSize));
+  }
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < queue.length) {
+      const batchIndex = nextIndex++;
+      const batchIds = queue[batchIndex];
+      try {
+        const updatedNodes = await requestNodeTests(batchIds);
+        applyUpdatedNodes(updatedNodes);
+      } catch (e) {
+        console.error("节点测速失败:", e);
+      } finally {
+        batchIds.forEach(id => testingNodeIds.delete(id));
+        render();
+        if (onBatchSettled) {
+          onBatchSettled(batchIds, batchIndex);
+        }
+      }
+    }
+  }
+  const workerCount = Math.min(requestConcurrency, queue.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
 }
 
 let pollInterval = null;
@@ -3895,35 +3952,15 @@ $("btn_batch_test").onclick = async () => {
   btn.disabled = true;
   btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width: 14px; height: 14px; display: inline-block; margin-right: 6px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>测试中...`;
   
-  pageNodes.forEach(n => testingNodeIds.add(n.id));
+  const ids = pageNodes.map(n => n.id);
+  ids.forEach(id => testingNodeIds.add(id));
   render();
 
   try {
-    const ids = pageNodes.map(n => n.id);
-    const chunkSize = 4;
-    for (let i = 0; i < ids.length; i += chunkSize) {
-      const chunkIds = ids.slice(i, i + chunkSize);
-      for (const id of chunkIds) {
-        try {
-          const response = await fetch("./api/test_node", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ id })
-          });
-          const result = await response.json();
-          if (result.ok && result.node) {
-            const idx = nodes.findIndex(item => item.id === id);
-            if (idx !== -1) {
-              nodes[idx] = result.node;
-            }
-          }
-        } catch (e) {
-        } finally {
-          testingNodeIds.delete(id);
-          render();
-        }
-      }
-    }
+    await runNodeTestBatches(ids, {
+      batchSize: 20,
+      requestConcurrency: 1
+    });
   } catch (e) {
   } finally {
     btn.disabled = false;
@@ -3956,38 +3993,10 @@ $("btn_batch_test_all").onclick = async () => {
   // 提取出所有节点的 ID，准备发送给后台
   const allIds = filteredNodes.map(n => n.id);
   
-  // 3. 分批调用后端批量测试接口，严格限制单批大小，避免小 VPS 被瞬间压满
-  const chunkSize = 10;
-
-  for (let i = 0; i < allIds.length; i += chunkSize) {
-    const chunkIds = allIds.slice(i, i + chunkSize);
-    try {
-      // 调用后端的批量测试 API (/api/test_nodes)
-      const response = await fetch("./api/test_nodes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: chunkIds })
-      });
-      const result = await response.json();
-
-      // 如果这 50 个节点测试完成了，就在前端更新它们的数据
-      if (result.ok && result.nodes) {
-        result.nodes.forEach(updatedNode => {
-          // 找到当前列表中对应的节点并覆盖其状态和延迟
-          const idx = nodes.findIndex(item => item.id === updatedNode.id);
-        if (idx !== -1) {
-          nodes[idx] = updatedNode; 
-        }
-      });
-      }
-    } catch (e) {
-      console.error("批量测试请求失败:", e);
-    } finally {
-      // 无论这批成功还是失败，都将它们从转圈的“检测中”状态移除
-      chunkIds.forEach(id => testingNodeIds.delete(id));
-      render(); // 刷新一下界面，让用户能看到一部分节点已经测试完毕变色了
-    }
-  }
+  await runNodeTestBatches(allIds, {
+    batchSize: 20,
+    requestConcurrency: 3
+  });
 
   // 4. 全部循环执行完毕，恢复按钮为可点击状态
   btn.disabled = false;
