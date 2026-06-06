@@ -90,6 +90,7 @@ MAX_MIRROR_SOURCES = int(os.environ.get("MAX_MIRROR_SOURCES", "8"))
 MIRROR_LIST_CACHE_SECONDS = int(os.environ.get("MIRROR_LIST_CACHE_SECONDS", "1800"))
 MAX_CONCURRENT_TEST_WORKERS = int(os.environ.get("MAX_CONCURRENT_TEST_WORKERS", "30"))
 MAX_BACKGROUND_TEST_NODES = int(os.environ.get("MAX_BACKGROUND_TEST_NODES", "60"))
+BACKGROUND_TEST_BATCH_PAUSE_SECONDS = int(os.environ.get("BACKGROUND_TEST_BATCH_PAUSE_SECONDS", "5"))
 MAX_BATCH_TEST_REQUEST_SIZE = int(os.environ.get("MAX_BATCH_TEST_REQUEST_SIZE", "20"))
 MANUAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("MANUAL_TEST_TIMEOUT_SECONDS", "8"))
 BACKGROUND_TEST_TIMEOUT_SECONDS = int(os.environ.get("BACKGROUND_TEST_TIMEOUT_SECONDS", "8"))
@@ -1444,9 +1445,9 @@ def connect_node(node_id: str) -> str:
             is_connecting = False
 
 def maintain_valid_nodes(force: bool = False) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting
+    global is_connecting
     if not maintain_job_lock.acquire(blocking=False):
-        return "后台节点更新已在进行中"
+        return "???????????"
     ensure_dirs()
     is_connecting = True
     try:
@@ -1463,12 +1464,12 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if target_id:
                         nodes = read_json(NODES_FILE, [])
                         if any(n.get("id") == target_id for n in nodes):
-                            print(f"[维护线程] 检测到固定 IP 模式下 OpenVPN 未运行，正在重新拉起同一节点: {target_id}", flush=True)
+                            print(f"[????] ????? IP ??? OpenVPN ??????????????: {target_id}", flush=True)
                             is_connecting = False
                             try:
                                 connect_node(target_id)
                             except Exception as e:
-                                print(f"[维护线程] 重新拉起固定节点 {target_id} 失败: {e}", flush=True)
+                                print(f"[????] ???????? {target_id} ??: {e}", flush=True)
                             is_connecting = True
                 else:
                     has_active_id = False
@@ -1477,50 +1478,48 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             has_active_id = True
                             stop_active_openvpn()
                     if has_active_id:
-                        print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
+                        print("[????] ????? OpenVPN ????????????????", flush=True)
                         is_connecting = False
                         auto_switch_node()
                         is_connecting = True
 
         try:
-            set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
+            set_state(is_connecting=True, last_check_message="????????? VPN ????...")
             candidates = fetch_candidates()
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             diag_msg = str(exc)
-            if not any(token in diag_msg for token in ["[ERR_", "错误代码"]):
+            if not any(token in diag_msg for token in ["[ERR_", "????"]):
                 err_code, raw_diag = vpn_utils.diagnose_api_failure(API_URL)
-                diag_msg = f"[错误代码 {err_code}] 获取节点失败: {exc} | 诊断结果: {raw_diag}"
+                diag_msg = f"[???? {err_code}] ??????: {exc} | ????: {raw_diag}"
             set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
             candidates = []
 
         if not candidates:
             is_connecting = False
-            return "没有拉取到新节点"
+            return "????????"
 
         with lock:
             active_node = None
             if active_openvpn_node_id:
                 current_nodes = read_json(NODES_FILE, [])
                 active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
-                
+
             merged: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
-            
+
             if active_node:
                 merged.append(active_node)
                 seen_ids.add(active_node["id"])
-                
+
             for cand in candidates:
                 if cand["id"] not in seen_ids:
                     merged.append(cand)
                     seen_ids.add(cand["id"])
-                    
-            # 【优化】将本地节点池的文件缓存上限扩大到 3000
-            # 防止获取到的海量节点在合并去重时被直接丢弃
+
             if len(merged) > 3000:
                 merged = merged[:3000]
-                
+
             for n in merged:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
@@ -1528,22 +1527,64 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         config_path.write_text(n["config_text"], encoding="utf-8")
                     except Exception:
                         pass
-                        
+
             write_json(NODES_FILE, merged)
 
-        # Test all non-active nodes from the list
-        with lock:
-            current_nodes = read_json(NODES_FILE, [])
-            to_test = [n for n in current_nodes if not n.get("active")]
-            to_test_ids = [n["id"] for n in to_test[:MAX_BACKGROUND_TEST_NODES]]
-            
-        print(f"[维护线程] 正在检测候选节点，共选择 {len(to_test_ids)} / {len(to_test)} 个优先节点...", flush=True)
-        set_state(is_connecting=True, last_check_message=f"正在分批检测候选节点可用性（本轮 {len(to_test_ids)} 个）...")
-        if to_test_ids:
+        tested_total = 0
+        batch_count = 0
+        while True:
+            with lock:
+                current_nodes = read_json(NODES_FILE, [])
+                pending_nodes = [
+                    n for n in current_nodes
+                    if not n.get("active") and n.get("probe_status") == "not_checked"
+                ]
+                to_test_ids = [n["id"] for n in pending_nodes[:MAX_BACKGROUND_TEST_NODES]]
+                pending_total = len(pending_nodes)
+
+            if not to_test_ids:
+                break
+
+            batch_count += 1
+            print(
+                f"[????] ????? {batch_count} ?????? {len(to_test_ids)} ??????? {pending_total} ?...",
+                flush=True,
+            )
+            set_state(
+                is_connecting=True,
+                last_check_message=(
+                    f"??????????????? {batch_count} ???? {len(to_test_ids)} ??"
+                    f"?? {pending_total} ?????..."
+                ),
+            )
             test_multiple_nodes(to_test_ids)
-        
+            tested_total += len(to_test_ids)
+
+            with lock:
+                remaining_not_checked = len(
+                    [
+                        n for n in read_json(NODES_FILE, [])
+                        if not n.get("active") and n.get("probe_status") == "not_checked"
+                    ]
+                )
+            if remaining_not_checked <= 0:
+                break
+
+            print(
+                f"[????] ???????{BACKGROUND_TEST_BATCH_PAUSE_SECONDS} ???????...",
+                flush=True,
+            )
+            set_state(
+                is_connecting=True,
+                last_check_message=(
+                    f"???????{BACKGROUND_TEST_BATCH_PAUSE_SECONDS} ????????"
+                    f"?? {remaining_not_checked} ????..."
+                ),
+            )
+            time.sleep(BACKGROUND_TEST_BATCH_PAUSE_SECONDS)
+
         is_connecting = False
-        
+
         with lock:
             merged = read_json(NODES_FILE, [])
             if not active_openvpn_running():
@@ -1552,25 +1593,24 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 if connection_enabled:
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     target_country = ui_cfg.get("force_country", "")
-                    
+
                     if routing_mode != "fixed_ip":
                         available_candidates = [n for n in merged if n.get("probe_status") == "available"]
                         if routing_mode == "fixed_region" and target_country:
                             available_candidates = [n for n in available_candidates if n.get("country") == target_country]
-                        
-                        # Apply routing_ip_type filter for auto-connect
+
                         routing_ip_type = ui_cfg.get("routing_ip_type", "all")
                         if routing_ip_type == "residential":
                             available_candidates = [n for n in available_candidates if n.get("ip_type") in ("residential", "mobile")]
                         elif routing_ip_type == "hosting":
                             available_candidates = [n for n in available_candidates if n.get("ip_type") == "hosting"]
                         available_candidates = apply_protocol_filter(available_candidates, ui_cfg.get("routing_protocol", ["udp"]))
-                        
+
                         if available_candidates:
                             auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        message = f"Fetched {len(candidates)} nodes. Tested {min(len(to_test_ids), len(current_nodes))} prioritized nodes."
+        message = f"Fetched {len(candidates)} nodes. Tested {tested_total} nodes in {batch_count} batch(es)."
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
@@ -1586,7 +1626,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
             maintain_job_lock.release()
         except RuntimeError:
             pass
-
 
 def collector_loop() -> None:
     global last_collector_heartbeat
