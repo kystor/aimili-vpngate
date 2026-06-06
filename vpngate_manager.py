@@ -2921,6 +2921,17 @@ INDEX_HTML = r"""<!doctype html>
       <option value="hosting">机房IP</option>
     </select>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
+    <div style="display: inline-flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.04); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 10px; min-height: 42px; color: var(--text-primary);">
+      <span style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">鍗忚绫诲瀷</span>
+      <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
+        <input type="checkbox" id="list_protocol_tcp" value="tcp" checked style="accent-color: #22c55e;">
+        <span>TCP</span>
+      </label>
+      <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
+        <input type="checkbox" id="list_protocol_udp" value="udp" checked style="accent-color: #22c55e;">
+        <span>UDP</span>
+      </label>
+    </div>
     <button id="btn_batch_test" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--primary-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
       批量测试本页
@@ -3260,6 +3271,13 @@ const translateProtocol = p => {
   return proto ? proto.toUpperCase() : "-";
 };
 
+const getNodeProtocol = node => {
+  const proto = ((node && node.proto) || "").toLowerCase();
+  if (proto.startsWith("tcp")) return "tcp";
+  if (proto === "udp") return "udp";
+  return "";
+};
+
 const translateCountry = c => {
   const dict = {
     "Japan": "日本",
@@ -3343,9 +3361,36 @@ function getLatencyClass(ms) {
   return 'latency-poor';
 }
 
-function getCountryCountMap() {
+function getListDisplayProtocols() {
+  const selected = [];
+  if ($("list_protocol_tcp")?.checked) selected.push("tcp");
+  if ($("list_protocol_udp")?.checked) selected.push("udp");
+  return selected;
+}
+
+function filterNodesForCountryCount() {
+  const selectedIpType = $("ip_type_filter")?.value || "";
+  const enabledProtocols = getListDisplayProtocols();
+  return nodes.filter(n => {
+    if (!n) return false;
+    if (selectedIpType) {
+      if (selectedIpType === "residential" && !["residential", "mobile"].includes(n.ip_type)) {
+        return false;
+      }
+      if (selectedIpType === "hosting" && n.ip_type !== "hosting") {
+        return false;
+      }
+    }
+    if (enabledProtocols.length > 0 && !enabledProtocols.includes(getNodeProtocol(n))) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function getCountryCountMap(baseNodes = nodes) {
   const countMap = {};
-  nodes.forEach(n => {
+  baseNodes.forEach(n => {
     if (n && n.country) {
       countMap[n.country] = (countMap[n.country] || 0) + 1;
     }
@@ -3356,7 +3401,7 @@ function getCountryCountMap() {
 function updateCountryFilter() {
   const select = $("country_filter");
   const selectedValue = select.value;
-  const countMap = getCountryCountMap();
+  const countMap = getCountryCountMap(filterNodesForCountryCount());
   const countries = Object.keys(countMap).sort();
   
   const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
@@ -3381,7 +3426,7 @@ function getFilteredNodes() {
   const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
   const selectedIpType = $("ip_type_filter").value;
-  const enabledProtocols = Array.isArray(state.routing_protocol) ? state.routing_protocol : [];
+  const enabledProtocols = getListDisplayProtocols();
   return nodes.filter(n => {
     if (!n) return false;
     if (selectedCountry && n.country !== selectedCountry) {
@@ -3395,9 +3440,7 @@ function getFilteredNodes() {
         return false;
       }
     }
-    const nodeProtocol = (n.proto || "").toLowerCase().startsWith("tcp")
-      ? "tcp"
-      : ((n.proto || "").toLowerCase() === "udp" ? "udp" : "");
+    const nodeProtocol = getNodeProtocol(n);
     if (enabledProtocols.length > 0 && !enabledProtocols.includes(nodeProtocol)) {
       return false;
     }
@@ -3616,7 +3659,7 @@ function render(){
       // Connect button is disabled if probe status is "unavailable", protocol is filtered out, or if we are already connecting
       const isUnavailable = n.probe_status === "unavailable";
       const enabledProtocols = Array.isArray(state.routing_protocol) ? state.routing_protocol : [];
-      const protocolAllowed = enabledProtocols.includes((n.proto || "").toLowerCase().startsWith("tcp") ? "tcp" : ((n.proto || "").toLowerCase() === "udp" ? "udp" : ""));
+      const protocolAllowed = enabledProtocols.includes(getNodeProtocol(n));
       const connectDisabled = isUnavailable || state.is_connecting || !protocolAllowed;
       const connectDisabledReason = !protocolAllowed ? "当前协议筛选未允许该节点" : (isUnavailable ? "当前节点不可用" : "");
       const connectBtn = isCurrentlyActive 
@@ -4008,9 +4051,24 @@ async function load(){
   }
 }
 
+function handleListProtocolFilterChange(event) {
+  if (getListDisplayProtocols().length === 0) {
+    alert("鍒楄〃灞曠ず璇疯嚦灏戝嬀閫変竴绉嶅崗璁?");
+    if (event && event.target) {
+      event.target.checked = true;
+    }
+    return;
+  }
+  currentPage = 1;
+  updateCountryFilter();
+  render();
+}
+
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
-$("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
+$("ip_type_filter").onchange=()=>{ currentPage = 1; updateCountryFilter(); render(); };
+$("list_protocol_tcp").onchange = handleListProtocolFilterChange;
+$("list_protocol_udp").onchange = handleListProtocolFilterChange;
 $("header_routing_country").onchange = saveHeaderRouting;
 $("header_routing_ip_type").onchange = saveHeaderRouting;
 $("header_protocol_tcp").onchange = saveHeaderRouting;
