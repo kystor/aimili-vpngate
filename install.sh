@@ -489,26 +489,9 @@ def print_status():
     else:
         print_line(format_line("节点状态", "无活动连接"))
     print_line()
-    local_proxy = state.get("local_proxy", f"http://127.0.0.1:{proxy_port}")
-    import urllib.parse
-    try:
-        parsed = urllib.parse.urlsplit(local_proxy)
-        proxy_host = parsed.hostname or "127.0.0.1"
-        proxy_port = parsed.port or proxy_port
-    except Exception:
-        proxy_host = "127.0.0.1"
-        proxy_port = proxy_port
-    
-    if proxy_host == "::":
-        socks_addr = "127.0.0.1"
-    elif ":" in proxy_host:
-        socks_addr = f"[{proxy_host}]"
-    else:
-        socks_addr = proxy_host
-
     print_line("【使用方法】")
-    print_line(f"  export http_proxy=socks5://{socks_addr}:{proxy_port}")
-    print_line(f"  export https_proxy=socks5://{socks_addr}:{proxy_port}")
+    print_line(f"  export http_proxy=socks5://{login_ip}:{proxy_port}")
+    print_line(f"  export https_proxy=socks5://{login_ip}:{proxy_port}")
     print_line("=======================================================")
 
 def run_service_cmd(cmd):
