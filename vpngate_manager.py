@@ -2404,6 +2404,43 @@ INDEX_HTML = r"""<!doctype html>
       background: #0f172a;
     }
 
+    .toolbar .protocol-filter-inline {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 42px;
+      padding: 0 12px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      color: var(--text-primary);
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+
+    .toolbar .protocol-filter-inline > span {
+      color: var(--text-secondary);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .toolbar .protocol-filter-inline label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    .toolbar .protocol-filter-inline input[type="checkbox"] {
+      width: auto;
+      height: auto;
+      min-width: 0;
+      margin: 0;
+      flex: 0 0 auto;
+      accent-color: #22c55e;
+    }
+
     .toolbar input {
       flex: 1;
       min-width: 250px;
@@ -2915,23 +2952,23 @@ INDEX_HTML = r"""<!doctype html>
     <select id="country_filter">
       <option value="">所有国家</option>
     </select>
+    <div class="protocol-filter-inline" aria-label="List protocol filter">
+      <span>&#23637;&#31034;&#21327;&#35758;</span>
+      <label title="Show TCP nodes in the list only">
+        <input type="checkbox" id="list_protocol_tcp" value="tcp" checked>
+        <span>TCP</span>
+      </label>
+      <label title="Show UDP nodes in the list only">
+        <input type="checkbox" id="list_protocol_udp" value="udp" checked>
+        <span>UDP</span>
+      </label>
+    </div>
     <select id="ip_type_filter">
       <option value="">所有IP类型</option>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
     </select>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
-    <div style="display: inline-flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.04); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 10px; min-height: 42px; color: var(--text-primary);">
-      <span style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">鍗忚绫诲瀷</span>
-      <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
-        <input type="checkbox" id="list_protocol_tcp" value="tcp" checked style="accent-color: #22c55e;">
-        <span>TCP</span>
-      </label>
-      <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
-        <input type="checkbox" id="list_protocol_udp" value="udp" checked style="accent-color: #22c55e;">
-        <span>UDP</span>
-      </label>
-    </div>
     <button id="btn_batch_test" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--primary-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
       批量测试本页
@@ -4053,7 +4090,7 @@ async function load(){
 
 function handleListProtocolFilterChange(event) {
   if (getListDisplayProtocols().length === 0) {
-    alert("鍒楄〃灞曠ず璇疯嚦灏戝嬀閫変竴绉嶅崗璁?");
+    alert("\u5217\u8868\u5c55\u793a\u8bf7\u81f3\u5c11\u52fe\u9009\u4e00\u79cd\u534f\u8bae");
     if (event && event.target) {
       event.target.checked = true;
     }
