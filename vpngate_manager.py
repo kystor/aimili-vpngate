@@ -1549,14 +1549,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
             batch_count += 1
             print(
-                f"[????] ????? {batch_count} ?????? {len(to_test_ids)} ??????? {pending_total} ?...",
+                f"[后台检测] 第 {batch_count} 批测试 {len(to_test_ids)} 个节点，当前剩余待测 {pending_total} 个...",
                 flush=True,
             )
             set_state(
                 is_connecting=True,
                 last_check_message=(
-                    f"??????????????? {batch_count} ???? {len(to_test_ids)} ??"
-                    f"?? {pending_total} ?????..."
+                    f"正在并发检测节点，第 {batch_count} 批 {len(to_test_ids)} 个，"
+                    f"剩余 {pending_total} 个待检测..."
                 ),
             )
             test_multiple_nodes(to_test_ids)
@@ -1573,14 +1573,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 break
 
             print(
-                f"[????] ???????{BACKGROUND_TEST_BATCH_PAUSE_SECONDS} ???????...",
+                f"[后台检测] 等待 {BACKGROUND_TEST_BATCH_PAUSE_SECONDS} 秒后继续检测...",
                 flush=True,
             )
             set_state(
                 is_connecting=True,
                 last_check_message=(
-                    f"???????{BACKGROUND_TEST_BATCH_PAUSE_SECONDS} ????????"
-                    f"?? {remaining_not_checked} ????..."
+                    f"等待 {BACKGROUND_TEST_BATCH_PAUSE_SECONDS} 秒后继续检测，"
+                    f"剩余 {remaining_not_checked} 个待检测..."
                 ),
             )
             time.sleep(BACKGROUND_TEST_BATCH_PAUSE_SECONDS)
