@@ -2863,7 +2863,7 @@ INDEX_HTML = r"""<!doctype html>
       </select>
     </div>
     <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
-      <span style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">协议:</span>
+      <span style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">使用协议:</span>
       <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: var(--text-primary);">
         <input type="checkbox" id="header_protocol_tcp" value="tcp" style="accent-color: #22c55e;">
         <span>TCP</span>
