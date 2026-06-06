@@ -79,6 +79,7 @@ import proxy_server
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 MIRROR_SITES_URL = os.environ.get("MIRROR_SITES_URL", "https://www.vpngate.net/en/sites.aspx")
+MIRROR_SITES_URLS = os.environ.get("MIRROR_SITES_URLS", "")
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "1260"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1260"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
@@ -86,8 +87,9 @@ TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
 # 这样可以一次性把官方 API 接口返回的所有可用节点全部吃进内存
 MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "2000"))
 ENABLE_MIRROR_AGGREGATION = str(os.environ.get("ENABLE_MIRROR_AGGREGATION", "1")).strip().lower() not in ("0", "false", "no", "off")
-MAX_MIRROR_SOURCES = int(os.environ.get("MAX_MIRROR_SOURCES", "8"))
+MAX_MIRROR_SOURCES = int(os.environ.get("MAX_MIRROR_SOURCES", "24"))
 MIRROR_LIST_CACHE_SECONDS = int(os.environ.get("MIRROR_LIST_CACHE_SECONDS", "1800"))
+EXTRA_VPNGATE_API_URLS = os.environ.get("EXTRA_VPNGATE_API_URLS", "")
 MAX_CONCURRENT_TEST_WORKERS = int(os.environ.get("MAX_CONCURRENT_TEST_WORKERS", "30"))
 MAX_BACKGROUND_TEST_NODES = int(os.environ.get("MAX_BACKGROUND_TEST_NODES", "60"))
 BACKGROUND_TEST_BATCH_PAUSE_SECONDS = int(os.environ.get("BACKGROUND_TEST_BATCH_PAUSE_SECONDS", "5"))
@@ -137,6 +139,15 @@ mirror_api_urls_cache: list[str] = []
 mirror_api_urls_cache_expires_at = 0.0
 maintain_job_lock = threading.Lock()
 test_job_semaphore = threading.BoundedSemaphore(max(1, MAX_CONCURRENT_TEST_WORKERS))
+
+DEFAULT_SEED_MIRROR_API_URLS = [
+    "http://160.251.62.107:46080/api/iphone/",
+    "http://211.184.148.43:29992/api/iphone/",
+    "http://124.51.253.126:24282/api/iphone/",
+    "http://147.47.35.218:36821/api/iphone/",
+    "http://118.46.213.47:23430/api/iphone/",
+    "http://212.24.103.106:58835/api/iphone/",
+]
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -395,6 +406,19 @@ def dedupe_keep_order(items: list[str]) -> list[str]:
         result.append(value)
     return result
 
+def split_env_urls(raw: str) -> list[str]:
+    if not raw:
+        return []
+    return dedupe_keep_order(re.split(r"[\r\n,;|]+", raw))
+
+def normalize_api_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    if not re.match(r"^https?://", value, flags=re.IGNORECASE):
+        return ""
+    return value if value.endswith("/") else value + "/"
+
 def build_fetch_attempt_targets(url: str) -> list[tuple[str, bool]]:
     attempts = [(url, True)]
     if url.startswith("https://"):
@@ -438,16 +462,33 @@ def fetch_vpngate_rows_from_source(source_url: str, max_attempts: int, source_la
     api_text, fetched_from = fetch_text_from_source(source_url, max_attempts, source_label, expect_api_payload=True)
     return parse_vpngate_rows(api_text), fetched_from
 
+def get_mirror_site_targets() -> list[str]:
+    return dedupe_keep_order([MIRROR_SITES_URL, *split_env_urls(MIRROR_SITES_URLS)])
+
+def get_manual_api_urls() -> list[str]:
+    urls = [normalize_api_url(url) for url in split_env_urls(EXTRA_VPNGATE_API_URLS)]
+    return [url for url in urls if url]
+
 def fetch_mirror_api_urls(force_refresh: bool = False) -> list[str]:
     global mirror_api_urls_cache, mirror_api_urls_cache_expires_at
     now = time.time()
     with lock:
         if not force_refresh and mirror_api_urls_cache and now < mirror_api_urls_cache_expires_at:
             return list(mirror_api_urls_cache)
-    html, fetched_from = fetch_text_from_source(MIRROR_SITES_URL, 1, "镜像列表页")
-    print(f"[fetch_candidates] 镜像列表页获取成功: {fetched_from}", flush=True)
-    mirrors = extract_mirror_page_urls(html)
-    api_urls = dedupe_keep_order([urllib.parse.urljoin(url, "../api/iphone/") for url in mirrors if url])
+    api_urls: list[str] = []
+    for index, site_url in enumerate(get_mirror_site_targets(), start=1):
+        try:
+            html, fetched_from = fetch_text_from_source(site_url, 1, f"镜像列表页{index}")
+            print(f"[fetch_candidates] 镜像列表页获取成功: {fetched_from}", flush=True)
+            mirrors = extract_mirror_page_urls(html)
+            api_urls.extend(normalize_api_url(urllib.parse.urljoin(url, "../api/iphone/")) for url in mirrors if url)
+        except Exception as exc:
+            warn_msg = f"镜像列表页抓取失败 ({site_url}): {exc}"
+            print(f"[fetch_candidates] {warn_msg}", flush=True)
+            log_to_json("WARNING", "Main", warn_msg)
+    api_urls.extend(DEFAULT_SEED_MIRROR_API_URLS)
+    api_urls.extend(get_manual_api_urls())
+    api_urls = [url for url in dedupe_keep_order(api_urls) if url][:MAX_MIRROR_SOURCES]
     with lock:
         mirror_api_urls_cache = api_urls
         mirror_api_urls_cache_expires_at = now + MIRROR_LIST_CACHE_SECONDS
@@ -685,7 +726,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
             mirror_api_urls = fetch_mirror_api_urls()
             if mirror_api_urls:
                 source_urls.extend(mirror_api_urls)
-                log_to_json("INFO", "Main", f"已加载 {len(mirror_api_urls)} 个镜像 API 源")
+                log_to_json("INFO", "Main", f"已加载 {len(mirror_api_urls)} 个镜像/附加 API 源")
             else:
                 log_to_json("WARNING", "Main", "镜像列表页可访问，但未解析出可用镜像 API 源")
         except Exception as exc:
@@ -1010,6 +1051,9 @@ def stop_active_openvpn() -> None:
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
+
+def tun_device_ready() -> bool:
+    return (not sys.platform.startswith("linux")) or Path("/sys/class/net/tun0").exists()
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # 【优化】对可用节点进行重新排序，强制优先选择底层的 UDP 节点
@@ -4869,8 +4913,9 @@ def background_proxy_checker() -> None:
                     proxy_error=error_msg
                 )
 
+                immediate_recover = active_openvpn_node_id and not tun_device_ready()
                 # If we intended to have an active VPN node but proxy failed, trigger auto-switch
-                if active_openvpn_node_id and proxy_health_failures >= PROXY_HEALTH_FAILURE_THRESHOLD:
+                if active_openvpn_node_id and (immediate_recover or proxy_health_failures >= PROXY_HEALTH_FAILURE_THRESHOLD):
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
@@ -4881,8 +4926,12 @@ def background_proxy_checker() -> None:
                                 mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
                                 active_node["probe_status"] = "unavailable"
                                 write_json(NODES_FILE, nodes)
+                        if immediate_recover:
+                            print("[代理守护线程] 检测到 tun0 已丢失，立即切换到备用节点。", flush=True)
                         auto_switch_node()
                     else:
+                        if immediate_recover:
+                            print(f"[代理守护线程] 检测到 tun0 已丢失，立即重连固定节点: {active_openvpn_node_id}", flush=True)
                         print(f"[代理守护线程] 固定 IP 模式下代理不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
                         is_connecting = False
                         try:
