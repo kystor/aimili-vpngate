@@ -10,6 +10,12 @@ import os          # [新增] 引入 os 库，用于处理文件路径
 from pathlib import Path # [新增] 引入 Path，用于安全获取当前文件所在目录
 from typing import Any
 
+TUN_DEVICE = "tun0"
+_tun_missing_log_lock = threading.Lock()
+_tun_missing_last_log_at = 0.0
+_throttled_log_lock = threading.Lock()
+_throttled_log_state: dict[str, dict[str, float | int]] = {}
+
 def parse_int(value: Any) -> int:
     try:
         return int(value)
@@ -51,8 +57,40 @@ def get_proxy_credentials():
     # 默认返回空，代表不需要密码验证
     return "", ""
 
+def tun_device_ready() -> bool:
+    return Path(f"/sys/class/net/{TUN_DEVICE}").exists()
+
+def raise_tun_not_ready(prefix: str) -> None:
+    global _tun_missing_last_log_at
+    err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] {prefix} 绑定虚拟网卡 {TUN_DEVICE} 失败，找不到设备！")
+    now = time.time()
+    with _tun_missing_log_lock:
+        if now - _tun_missing_last_log_at >= 5:
+            _tun_missing_last_log_at = now
+            print(f"[代理熔断] {err}", flush=True)
+    raise err
+
+def throttled_print(key: str, message: str, interval_seconds: float = 5.0) -> None:
+    now = time.time()
+    with _throttled_log_lock:
+        state = _throttled_log_state.get(key)
+        if state is None:
+            _throttled_log_state[key] = {"last": now, "suppressed": 0}
+            print(message, flush=True)
+            return
+        last = float(state.get("last", 0.0))
+        suppressed = int(state.get("suppressed", 0))
+        if now - last >= interval_seconds:
+            suffix = f" [限流期间省略 {suppressed} 条同类日志]" if suppressed > 0 else ""
+            _throttled_log_state[key] = {"last": now, "suppressed": 0}
+            print(f"{message}{suffix}", flush=True)
+            return
+        state["suppressed"] = suppressed + 1
+
 def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
     """通过虚拟网卡 tun0 进行 DNS 解析，确保解析过程也走 VPN 隧道"""
+    if not tun_device_ready():
+        raise_tun_not_ready("DNS 解析")
     try:
         socket.inet_aton(host)
         return host
@@ -154,6 +192,8 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     """创建前往目标的 TCP 连接，强制绑定 tun0 网卡实现透明代理"""
+    if not tun_device_ready():
+        raise_tun_not_ready("代理请求目标连接")
     host, port = address
     resolved_ip = resolve_dns_over_tun0(host)
     if resolved_ip:
@@ -204,13 +244,20 @@ def socks5_udp_relay(tcp_client: socket.socket) -> None:
     udp_server = None
     outbound_udp = None
     try:
+        if not tun_device_ready():
+            raise_tun_not_ready("UDP 代理")
         local_ip = tcp_client.getsockname()[0]
         af = socket.AF_INET6 if ":" in local_ip else socket.AF_INET
+        try:
+            print(f"[SOCKS5 UDP] 客户端 {tcp_client.getpeername()} 发起 UDP ASSOCIATE", flush=True)
+        except OSError:
+            print("[SOCKS5 UDP] 收到 UDP ASSOCIATE 请求", flush=True)
         
         # 1. 创建本地 UDP 服务端监听客户端的 UDP 发包
         udp_server = socket.socket(af, socket.SOCK_DGRAM)
         udp_server.bind((local_ip, 0))
         bound_ip, bound_port = udp_server.getsockname()
+        print(f"[SOCKS5 UDP] 已分配本地 UDP 中继端口 {bound_ip}:{bound_port}", flush=True)
         
         # 2. 将分配好的 IP 和 端口通过 TCP 应答告诉客户端
         # 【优化】修复 NAT 公网穿透。不返回绑定的内网 IP，而是返回 0.0.0.0
@@ -390,7 +437,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             try:
                 upstream = create_connection((host, port), timeout=20)
             except Exception as e:
-                print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
+                throttled_print("socks5_connect_fail", f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}")
                 try:
                     client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
                 except OSError:
@@ -400,6 +447,10 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             relay(client, upstream)
             
         elif command == 3:
+            try:
+                print(f"[SOCKS5] 收到 UDP ASSOCIATE，请求源 {client.getpeername()}", flush=True)
+            except OSError:
+                print("[SOCKS5] 收到 UDP ASSOCIATE", flush=True)
             socks5_udp_relay(client)
             
     finally:
@@ -447,7 +498,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception as e:
-        print(f"[HTTP 代理失败] 代理请求目标连接失败: {e}", flush=True)
+        throttled_print("http_connect_fail", f"[HTTP 代理失败] 代理请求目标连接失败: {e}")
         try:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         except OSError:
@@ -469,7 +520,7 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
     except Exception as e:
         err_msg = str(e)
         if "[错误代码" in err_msg:
-            print(f"[代理客户端连接失败] 客户端 {address} 遭遇系统性阻碍: {err_msg}", flush=True)
+            throttled_print("proxy_client_fail", f"[代理客户端连接失败] 客户端 {address} 遭遇系统性阻碍: {err_msg}")
         try:
             client.close()
         except OSError:
