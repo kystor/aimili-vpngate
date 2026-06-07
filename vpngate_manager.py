@@ -78,9 +78,11 @@ import vpn_utils
 import proxy_server
 
 API_URL = "https://www.vpngate.net/api/iphone/"
-FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "1260"))
+FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", str(12 * 60 * 60)))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1260"))
-TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
+TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "5"))
+AUTO_REFRESH_COOLDOWN_SECONDS = int(os.environ.get("AUTO_REFRESH_COOLDOWN_SECONDS", str(60 * 60)))
+COLLECTOR_DECISION_INTERVAL_SECONDS = int(os.environ.get("COLLECTOR_DECISION_INTERVAL_SECONDS", "30"))
 # 【优化】将默认单次从 API 扫描的最大节点数量从 300 提升到 2000
 # 这样可以一次性把官方 API 接口返回的所有可用节点全部吃进内存
 MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "2000"))
@@ -364,7 +366,11 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_fetch_message", "")
     state.setdefault("last_check_message", "")
     state.setdefault("valid_nodes", 0)
+    state.setdefault("routed_valid_nodes", 0)
     state.setdefault("blacklisted_nodes", 0)
+    state.setdefault("auto_refresh_completed_at", 0.0)
+    state.setdefault("auto_refresh_cooldown_until", 0.0)
+    state.setdefault("last_auto_refresh_reason", "")
     state["local_proxy"] = get_proxy_listen_url()
     state["proxy_entry"] = get_proxy_display_url()
 
@@ -449,6 +455,7 @@ def merge_node_runtime_fields(base_node: dict[str, Any], old_node: dict[str, Any
         "quality",
         "active",
         "fetched_at",
+        "is_testing",
     ]:
         if key in old_node:
             merged[key] = old_node.get(key)
@@ -1082,6 +1089,21 @@ def filter_nodes_for_routing(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any]
 
     return apply_protocol_filter(filtered, ui_cfg.get("routing_protocol", ["udp"]))
 
+def count_available_nodes_for_routing(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any]) -> int:
+    routed_nodes = filter_nodes_for_routing(nodes, ui_cfg)
+    return len([node for node in routed_nodes if node.get("probe_status") == "available"])
+
+def should_trigger_auto_refresh(state: dict[str, Any], available_count: int, now: float) -> tuple[bool, str]:
+    cooldown_until = float(state.get("auto_refresh_cooldown_until", 0) or 0)
+    last_refresh_at = float(state.get("auto_refresh_completed_at", 0) or 0)
+    if cooldown_until > now:
+        return False, "cooldown"
+    if available_count < TARGET_VALID_NODES:
+        return True, "low_stock"
+    if now - last_refresh_at >= FETCH_INTERVAL_SECONDS:
+        return True, "interval"
+    return False, "wait"
+
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     active_nodes = [node for node in nodes if node.get("active")]
     available_nodes = sorted(
@@ -1621,24 +1643,163 @@ def maintain_valid_nodes(force: bool = False) -> str:
             is_connecting = False
         maintain_job_lock.release()
 
+def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> str:
+    global is_connecting
+    ensure_dirs()
+    if not maintain_job_lock.acquire(blocking=False):
+        return "节点维护已在进行中"
+
+    with lock:
+        is_connecting = True
+
+    try:
+        if force and disconnect_active:
+            stop_active_openvpn()
+
+        set_state(is_connecting=True, last_check_message="正在抓取最新节点列表")
+        try:
+            candidates = fetch_candidates()
+        except Exception as exc:
+            vpn_utils.check_and_fix_dns()
+            set_state(
+                last_fetch_at=time.time(),
+                last_fetch_status="error",
+                last_fetch_message=str(exc),
+                is_connecting=False,
+            )
+            return f"抓取节点失败: {exc}"
+
+        with lock:
+            old_nodes = read_json(NODES_FILE, [])
+
+        old_by_endpoint = {node_endpoint_key(node): node for node in old_nodes}
+        merged_nodes: list[dict[str, Any]] = []
+        seen_endpoints: set[tuple[str, int, str]] = set()
+
+        for candidate in candidates:
+            key = node_endpoint_key(candidate)
+            old_node = old_by_endpoint.get(key)
+            merged = merge_node_runtime_fields(candidate, old_node) if old_node else dict(candidate)
+            merged["missing_from_latest_fetch"] = False
+            merged_nodes.append(merged)
+            seen_endpoints.add(key)
+
+        for old_node in old_nodes:
+            key = node_endpoint_key(old_node)
+            if key in seen_endpoints:
+                continue
+            if old_node.get("active"):
+                kept = dict(old_node)
+                kept["missing_from_latest_fetch"] = True
+                merged_nodes.append(kept)
+                seen_endpoints.add(key)
+                continue
+            if (
+                old_node.get("probe_status") == "available"
+                and 0 < parse_int(old_node.get("latency_ms")) <= KEEP_OLD_NODE_LATENCY_MS
+            ):
+                kept = dict(old_node)
+                kept["missing_from_latest_fetch"] = True
+                merged_nodes.append(kept)
+                seen_endpoints.add(key)
+
+        merged_nodes = sort_all_nodes(merged_nodes)[:MAX_CACHED_NODES]
+        write_json(NODES_FILE, merged_nodes)
+
+        ui_cfg = load_ui_config()
+        pending_ids = [
+            str(node.get("id") or "")
+            for node in filter_nodes_for_routing(merged_nodes, ui_cfg)
+            if not node.get("active") and node.get("probe_status") != "available"
+        ]
+
+        while pending_ids:
+            current_nodes = read_json(NODES_FILE, [])
+            routed_valid_nodes = count_available_nodes_for_routing(current_nodes, ui_cfg)
+            if routed_valid_nodes >= TARGET_VALID_NODES:
+                break
+            batch_ids = pending_ids[:MAX_BATCH_TEST_REQUEST_SIZE]
+            pending_ids = pending_ids[MAX_BATCH_TEST_REQUEST_SIZE:]
+            set_state(is_connecting=True, last_check_message=f"正在检测 {len(batch_ids)} 个节点")
+            test_multiple_nodes(batch_ids)
+
+        final_nodes = read_json(NODES_FILE, [])
+        valid_nodes_count = len([node for node in final_nodes if node.get("probe_status") == "available"])
+        routed_valid_nodes = count_available_nodes_for_routing(final_nodes, ui_cfg)
+        refresh_completed_at = time.time()
+        cooldown_until = refresh_completed_at + AUTO_REFRESH_COOLDOWN_SECONDS if routed_valid_nodes < TARGET_VALID_NODES else 0.0
+
+        if ui_cfg.get("connection_enabled", True) and not active_openvpn_running():
+            if ui_cfg.get("routing_mode") == "fixed_ip":
+                target_id = str(ui_cfg.get("fixed_node_id") or active_openvpn_node_id or "").strip()
+                if target_id and any(node.get("id") == target_id for node in final_nodes):
+                    with lock:
+                        is_connecting = False
+                    try:
+                        connect_node(target_id)
+                    finally:
+                        with lock:
+                            is_connecting = True
+            else:
+                filtered_available = filter_nodes_for_routing(
+                    [node for node in final_nodes if node.get("probe_status") == "available"],
+                    ui_cfg,
+                )
+                if filtered_available:
+                    with lock:
+                        is_connecting = False
+                    try:
+                        auto_switch_node()
+                    finally:
+                        with lock:
+                            is_connecting = True
+
+        message = f"已抓取 {len(candidates)} 个节点，当前可用 {valid_nodes_count} 个，当前协议可用 {routed_valid_nodes} 个"
+        if cooldown_until > 0:
+            message += "，库存不足，进入 1 小时冷却"
+
+        set_state(
+            last_fetch_at=refresh_completed_at,
+            last_fetch_status="success",
+            last_fetch_message=message,
+            last_check_at=refresh_completed_at,
+            last_check_message=message,
+            valid_nodes=valid_nodes_count,
+            routed_valid_nodes=routed_valid_nodes,
+            auto_refresh_completed_at=refresh_completed_at,
+            auto_refresh_cooldown_until=cooldown_until,
+            active_openvpn_node_id=active_openvpn_node_id,
+            is_connecting=False,
+        )
+        schedule_followup_tests(MAX_MAINTAIN_TEST_NODES)
+        return message
+    finally:
+        with lock:
+            is_connecting = False
+        maintain_job_lock.release()
+
 def collector_loop() -> None:
     global last_collector_heartbeat
     while True:
         last_collector_heartbeat = time.time()
-        success = False
         try:
-            res = maintain_valid_nodes(force=False)
-            if "没有拉取到新节点" not in res:
-                success = True
+            current_nodes = read_json(NODES_FILE, [])
+            ui_cfg = load_ui_config()
+            total_valid_nodes = len([node for node in current_nodes if node.get("probe_status") == "available"])
+            routed_valid_nodes = count_available_nodes_for_routing(current_nodes, ui_cfg)
+            current_state = get_state()
+            should_refresh, refresh_reason = should_trigger_auto_refresh(current_state, routed_valid_nodes, time.time())
+            set_state(
+                valid_nodes=total_valid_nodes,
+                routed_valid_nodes=routed_valid_nodes,
+                last_auto_refresh_reason=refresh_reason if should_refresh else current_state.get("last_auto_refresh_reason", ""),
+            )
+            if should_refresh:
+                run_node_refresh(force=False, disconnect_active=False)
         except Exception as exc:
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
-            
-        if not active_openvpn_running() and not success:
-            sleep_time = 30
-        else:
-            sleep_time = CHECK_INTERVAL_SECONDS
-            
-        time.sleep(sleep_time)
+
+        time.sleep(COLLECTOR_DECISION_INTERVAL_SECONDS)
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -5426,12 +5587,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path == "/api/check":
             try:
-                self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
+                self.send_json({"ok": True, "message": run_node_refresh(force=True, disconnect_active=True)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_nodes":
             try:
-                threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
+                threading.Thread(target=run_node_refresh, kwargs={"force": False, "disconnect_active": False}, daemon=True).start()
                 self.send_json({"ok": True, "message": "已在后台启动节点更新流程"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
