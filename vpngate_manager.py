@@ -90,9 +90,10 @@ ENABLE_MIRROR_AGGREGATION = str(os.environ.get("ENABLE_MIRROR_AGGREGATION", "1")
 MAX_MIRROR_SOURCES = int(os.environ.get("MAX_MIRROR_SOURCES", "24"))
 MIRROR_LIST_CACHE_SECONDS = int(os.environ.get("MIRROR_LIST_CACHE_SECONDS", "1800"))
 EXTRA_VPNGATE_API_URLS = os.environ.get("EXTRA_VPNGATE_API_URLS", "")
-MAX_CONCURRENT_TEST_WORKERS = int(os.environ.get("MAX_CONCURRENT_TEST_WORKERS", "15"))
-MAX_BACKGROUND_TEST_NODES = int(os.environ.get("MAX_BACKGROUND_TEST_NODES", "30"))
+MAX_CONCURRENT_TEST_WORKERS = int(os.environ.get("MAX_CONCURRENT_TEST_WORKERS", "2"))
+MAX_BACKGROUND_TEST_NODES = int(os.environ.get("MAX_BACKGROUND_TEST_NODES", "4"))
 BACKGROUND_TEST_BATCH_PAUSE_SECONDS = int(os.environ.get("BACKGROUND_TEST_BATCH_PAUSE_SECONDS", "5"))
+BACKGROUND_TEST_START_DELAY_SECONDS = int(os.environ.get("BACKGROUND_TEST_START_DELAY_SECONDS", "20"))
 MAX_BATCH_TEST_REQUEST_SIZE = int(os.environ.get("MAX_BATCH_TEST_REQUEST_SIZE", "20"))
 MANUAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("MANUAL_TEST_TIMEOUT_SECONDS", "8"))
 BACKGROUND_TEST_TIMEOUT_SECONDS = int(os.environ.get("BACKGROUND_TEST_TIMEOUT_SECONDS", "8"))
@@ -139,6 +140,7 @@ AUTO_SWITCH_NO_CANDIDATE_LOG_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SWITCH_
 mirror_api_urls_cache: list[str] = []
 mirror_api_urls_cache_expires_at = 0.0
 maintain_job_lock = threading.Lock()
+background_test_lock = threading.Lock()
 test_job_semaphore = threading.BoundedSemaphore(max(1, MAX_CONCURRENT_TEST_WORKERS))
 
 DEFAULT_SEED_MIRROR_API_URLS = [
@@ -1272,57 +1274,96 @@ def test_multiple_nodes(node_ids: list[str], connect_on_first_available: bool = 
             "quality": "",
         }
 
+    def apply_results(results_map: dict[str, dict[str, Any]]) -> None:
+        if not results_map:
+            return
+        successful_nodes = [item for item in results_map.values() if item.get("probe_status") == "available"]
+        if successful_nodes:
+            try:
+                vpn_utils.enrich_ip_info(successful_nodes)
+            except Exception as e:
+                print(f"[批量富化失败] 补充节点归属信息失败: {e}", flush=True)
+
+        with lock:
+            current_nodes = read_json(NODES_FILE, [])
+            for node in current_nodes:
+                node_id = node.get("id")
+                if node_id in results_map:
+                    node.update(results_map[node_id])
+            sorted_nodes = sort_all_nodes(current_nodes)
+            write_json(NODES_FILE, sorted_nodes)
+            valid_nodes_count = len([item for item in sorted_nodes if item.get("probe_status") == "available"])
+        set_state(last_check_at=time.time(), valid_nodes=valid_nodes_count)
+
+    def read_future_result(future: concurrent.futures.Future[dict[str, Any]], node_id: str) -> dict[str, Any]:
+        try:
+            result = future.result()
+        except Exception as e:
+            result = {
+                "id": node_id,
+                "latency_ms": 0,
+                "probe_status": "unavailable",
+                "probe_message": f"测速异常: {e}",
+            }
+        updated_nodes_map[node_id] = result
+        return result
+
     updated_nodes_map: dict[str, dict[str, Any]] = {}
     connected_node_id = ""
     max_workers = min(MAX_CONCURRENT_TEST_WORKERS, max(1, len(to_test)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(test_worker, node): str(node.get("id") or "") for node in to_test}
-        for future in concurrent.futures.as_completed(futures):
-            node_id = futures[future]
-            try:
-                result = future.result()
-            except Exception as e:
-                result = {
-                    "id": node_id,
-                    "latency_ms": 0,
-                    "probe_status": "unavailable",
-                    "probe_message": f"测速异常: {e}",
-                }
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    pending_nodes = iter(to_test)
+    futures: dict[concurrent.futures.Future[dict[str, Any]], str] = {}
+    batch_closed = False
 
-            updated_nodes_map[node_id] = result
-            if (
-                connect_on_first_available
-                and not connected_node_id
-                and result.get("probe_status") == "available"
-                and not active_openvpn_running()
-            ):
-                try:
-                    print(f"[后台检测] 节点 {node_id} 可用，正在立即连接...", flush=True)
-                    with lock:
-                        is_connecting = False
-                    connect_node(node_id)
-                    connected_node_id = node_id
-                    result["probe_message"] = f"当前已连接，代理入口: {get_proxy_display_url()}"
-                except Exception as e:
-                    print(f"[后台检测] 节点 {node_id} 可用，但立即连接失败: {e}", flush=True)
-
-    successful_nodes = [item for item in updated_nodes_map.values() if item.get("probe_status") == "available"]
-    if successful_nodes:
+    def submit_next() -> bool:
         try:
-            vpn_utils.enrich_ip_info(successful_nodes)
-        except Exception as e:
-            print(f"[批量富化失败] 补充节点归属信息失败: {e}", flush=True)
+            node = next(pending_nodes)
+        except StopIteration:
+            return False
+        future = executor.submit(test_worker, node)
+        futures[future] = str(node.get("id") or "")
+        return True
 
-    with lock:
-        current_nodes = read_json(NODES_FILE, [])
-        for node in current_nodes:
-            node_id = node.get("id")
-            if node_id in updated_nodes_map:
-                node.update(updated_nodes_map[node_id])
-        sorted_nodes = sort_all_nodes(current_nodes)
-        write_json(NODES_FILE, sorted_nodes)
+    try:
+        for _ in range(max_workers):
+            if not submit_next():
+                break
 
-    return [updated_nodes_map[node_id] for node_id in node_ids if node_id in updated_nodes_map]
+        while futures:
+            done, _ = concurrent.futures.wait(set(futures), return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                node_id = futures.pop(future)
+                result = read_future_result(future, node_id)
+                if (
+                    connect_on_first_available
+                    and not connected_node_id
+                    and result.get("probe_status") == "available"
+                    and not active_openvpn_running()
+                ):
+                    try:
+                        print(f"[前台检测] 节点 {node_id} 可用，正在立即连接...", flush=True)
+                        with lock:
+                            is_connecting = False
+                        connect_node(node_id)
+                        connected_node_id = node_id
+                        result["probe_message"] = f"当前已连接，代理入口: {get_proxy_display_url()}"
+                        updated_nodes_map[node_id] = result
+                    except Exception as e:
+                        print(f"[前台检测] 节点 {node_id} 可用，但立即连接失败: {e}", flush=True)
+
+                if connect_on_first_available and (connected_node_id or active_openvpn_running()):
+                    if not batch_closed:
+                        print("[前台检测] 已连上首个可用节点，本批已启动的测速任务将自然收尾，不再继续扩批。", flush=True)
+                        batch_closed = True
+                    continue
+
+                submit_next()
+
+        apply_results(updated_nodes_map)
+        return [updated_nodes_map[node_id] for node_id in node_ids if node_id in updated_nodes_map]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=False)
 
 def auto_switch_node(attempt: int = 0) -> None:
     global auto_switch_fetch_in_progress, auto_switch_last_fetch_at, auto_switch_last_no_candidate_log
@@ -1534,6 +1575,85 @@ def connect_node(node_id: str) -> str:
         with lock:
             is_connecting = False
 
+def start_background_pending_tests(delay_seconds: int = 0) -> None:
+    if background_test_lock.locked():
+        return
+
+    def worker() -> None:
+        if not background_test_lock.acquire(blocking=False):
+            return
+        try:
+            if delay_seconds > 0:
+                print(f"[后台补测] 已安排 {delay_seconds} 秒后启动后台补测，避免刚连上就继续扰动网络。", flush=True)
+                time.sleep(delay_seconds)
+
+            batch_count = 0
+            tested_total = 0
+            while True:
+                with lock:
+                    current_nodes = read_json(NODES_FILE, [])
+                    pending_nodes = [
+                        n for n in current_nodes
+                        if not n.get("active") and n.get("probe_status") == "not_checked"
+                    ]
+                    to_test_ids = [str(n.get("id") or "") for n in pending_nodes[:MAX_BACKGROUND_TEST_NODES] if n.get("id")]
+                    pending_total = len(pending_nodes)
+
+                if not to_test_ids:
+                    break
+
+                batch_count += 1
+                print(
+                    f"[后台补测] 第 {batch_count} 批测试 {len(to_test_ids)} 个节点，剩余 {pending_total} 个待测速...",
+                    flush=True,
+                )
+                if active_openvpn_running() and active_openvpn_node_id:
+                    set_state(
+                        is_connecting=False,
+                        active_openvpn_node_id=active_openvpn_node_id,
+                        last_check_message=f"已连接节点 {active_openvpn_node_id}，后台正在补测剩余 {pending_total} 个节点...",
+                    )
+                else:
+                    set_state(
+                        is_connecting=False,
+                        active_openvpn_node_id=active_openvpn_node_id,
+                        last_check_message=f"后台正在补测第 {batch_count} 批节点，剩余 {pending_total} 个待测速...",
+                    )
+
+                tested_total += len(test_multiple_nodes(to_test_ids, connect_on_first_available=False))
+
+                with lock:
+                    remaining_not_checked = len(
+                        [
+                            n for n in read_json(NODES_FILE, [])
+                            if not n.get("active") and n.get("probe_status") == "not_checked"
+                        ]
+                    )
+                if remaining_not_checked <= 0:
+                    break
+                time.sleep(BACKGROUND_TEST_BATCH_PAUSE_SECONDS)
+
+            with lock:
+                merged = read_json(NODES_FILE, [])
+                valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
+            if active_openvpn_running() and active_openvpn_node_id:
+                message = f"已连接节点 {active_openvpn_node_id}，后台补测完成，当前共有 {valid_nodes_count} 个可用节点。"
+            else:
+                message = f"后台补测完成，本轮共处理 {tested_total} 个节点，当前共有 {valid_nodes_count} 个可用节点。"
+            set_state(
+                last_check_at=time.time(),
+                last_check_message=message,
+                active_openvpn_node_id=active_openvpn_node_id,
+                valid_nodes=valid_nodes_count,
+                is_connecting=False,
+            )
+        except Exception as e:
+            print(f"[后台补测] 补测节点时出错: {e}", flush=True)
+        finally:
+            background_test_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
 def maintain_valid_nodes(force: bool = False) -> str:
     global is_connecting
     if not maintain_job_lock.acquire(blocking=False):
@@ -1718,7 +1838,27 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         tested_total = 0
         batch_count = 0
-        connected_early = active_openvpn_running()
+        if connect_best_available_node():
+            with lock:
+                merged = read_json(NODES_FILE, [])
+                valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
+                remaining_not_checked = len(
+                    [n for n in merged if not n.get("active") and n.get("probe_status") == "not_checked"]
+                )
+            message = f"已连接节点 {active_openvpn_node_id}。"
+            if remaining_not_checked > 0:
+                message += f" 剩余 {remaining_not_checked} 个待测速节点将在后台延后补测。"
+                start_background_pending_tests(BACKGROUND_TEST_START_DELAY_SECONDS)
+            else:
+                message += " 当前没有待测速节点。"
+            set_state(
+                last_check_at=time.time(),
+                last_check_message=message,
+                active_openvpn_node_id=active_openvpn_node_id,
+                valid_nodes=valid_nodes_count,
+                is_connecting=False,
+            )
+            return message
 
         while True:
             with lock:
@@ -1727,7 +1867,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     n for n in current_nodes
                     if not n.get("active") and n.get("probe_status") == "not_checked"
                 ]
-                to_test_ids = [n["id"] for n in pending_nodes[:MAX_BACKGROUND_TEST_NODES]]
+                to_test_ids = [str(n.get("id") or "") for n in pending_nodes[:MAX_BACKGROUND_TEST_NODES] if n.get("id")]
                 pending_total = len(pending_nodes)
 
             if not to_test_ids:
@@ -1735,21 +1875,38 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
             batch_count += 1
             print(
-                f"[后台检测] 第 {batch_count} 批测试 {len(to_test_ids)} 个节点，当前剩余待测 {pending_total} 个...",
+                f"[前台检测] 第 {batch_count} 批测试 {len(to_test_ids)} 个节点，当前剩余待测速 {pending_total} 个...",
                 flush=True,
             )
-            if not connected_early:
+            set_state(
+                is_connecting=True,
+                active_node_latency="正在连接",
+                last_check_message=(
+                    f"正在并发检测第 {batch_count} 批节点，共 {len(to_test_ids)} 个，"
+                    f"剩余 {pending_total} 个待测速，发现可用节点会立即连接..."
+                ),
+            )
+            tested_total += len(test_multiple_nodes(to_test_ids, connect_on_first_available=True))
+
+            if active_openvpn_running() and active_openvpn_node_id:
+                with lock:
+                    merged = read_json(NODES_FILE, [])
+                    valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
+                    remaining_not_checked = len(
+                        [n for n in merged if not n.get("active") and n.get("probe_status") == "not_checked"]
+                    )
+                message = f"已连接节点 {active_openvpn_node_id}，前台已处理 {tested_total} 个节点。"
+                if remaining_not_checked > 0:
+                    message += f" 剩余 {remaining_not_checked} 个待测速节点将在后台延后补测。"
+                    start_background_pending_tests(BACKGROUND_TEST_START_DELAY_SECONDS)
                 set_state(
-                    is_connecting=True,
-                    last_check_message=(
-                        f"正在并发检测节点，第 {batch_count} 批 {len(to_test_ids)} 个，"
-                        f"剩余 {pending_total} 个待检测，发现可用节点会立即连接..."
-                    ),
+                    last_check_at=time.time(),
+                    last_check_message=message,
+                    active_openvpn_node_id=active_openvpn_node_id,
+                    valid_nodes=valid_nodes_count,
+                    is_connecting=False,
                 )
-            test_multiple_nodes(to_test_ids, connect_on_first_available=True)
-            tested_total += len(to_test_ids)
-            if not connected_early:
-                connected_early = connect_best_available_node()
+                return message
 
             with lock:
                 remaining_not_checked = len(
@@ -1762,39 +1919,52 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 break
 
             print(
-                f"[后台检测] 等待 {BACKGROUND_TEST_BATCH_PAUSE_SECONDS} 秒后继续检测...",
+                f"[前台检测] 第 {batch_count} 批暂未找到可用节点，{BACKGROUND_TEST_BATCH_PAUSE_SECONDS} 秒后继续...",
                 flush=True,
             )
-            if not connected_early:
-                set_state(
-                    is_connecting=True,
-                    last_check_message=(
-                        f"等待 {BACKGROUND_TEST_BATCH_PAUSE_SECONDS} 秒后继续检测，"
-                        f"剩余 {remaining_not_checked} 个待检测..."
-                    ),
-                )
+            set_state(
+                is_connecting=True,
+                active_node_latency="继续检测",
+                last_check_message=(
+                    f"第 {batch_count} 批暂未找到可用节点，"
+                    f"{BACKGROUND_TEST_BATCH_PAUSE_SECONDS} 秒后继续检测，剩余 {remaining_not_checked} 个待测速..."
+                ),
+            )
             time.sleep(BACKGROUND_TEST_BATCH_PAUSE_SECONDS)
 
         is_connecting = False
 
-        with lock:
-            merged = read_json(NODES_FILE, [])
-        if not active_openvpn_running():
-            connect_best_available_node()
+        if connect_best_available_node():
             with lock:
                 merged = read_json(NODES_FILE, [])
+                valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
+                remaining_not_checked = len(
+                    [n for n in merged if not n.get("active") and n.get("probe_status") == "not_checked"]
+                )
+            message = f"已连接节点 {active_openvpn_node_id}，前台共处理 {tested_total} 个节点。"
+            if remaining_not_checked > 0:
+                message += f" 剩余 {remaining_not_checked} 个待测速节点将在后台延后补测。"
+                start_background_pending_tests(BACKGROUND_TEST_START_DELAY_SECONDS)
+            set_state(
+                last_check_at=time.time(),
+                last_check_message=message,
+                active_openvpn_node_id=active_openvpn_node_id,
+                valid_nodes=valid_nodes_count,
+                is_connecting=False,
+            )
+            return message
 
-        valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        if active_openvpn_running() and active_openvpn_node_id:
-            message = f"已获取 {len(candidates)} 个节点，已测试 {tested_total} 个节点，当前已连接 {active_openvpn_node_id}。"
-        else:
-            message = f"已获取 {len(candidates)} 个节点，已测试 {tested_total} 个节点，共 {batch_count} 批。"
+        with lock:
+            merged = read_json(NODES_FILE, [])
+            valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
+        message = f"已获取 {len(candidates)} 个节点，前台共处理 {tested_total} 个节点，暂未找到可用连接。"
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
             active_openvpn_node_id=active_openvpn_node_id,
             valid_nodes=valid_nodes_count,
             is_connecting=False,
+            active_node_latency="无活动连接",
         )
         return message
     except Exception as e:
