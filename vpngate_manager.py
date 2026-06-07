@@ -1057,25 +1057,10 @@ def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
     with lock:
         cleanup_policy_routing()
-        config_to_delete = None
-        if active_openvpn_node_id:
-            nodes = read_json(NODES_FILE, [])
-            node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
-            if node:
-                config_to_delete = node.get("config_file")
-                
         stop_process(active_openvpn_process)
         active_openvpn_process = None
         active_openvpn_node_id = ""
         kill_existing_openvpn_processes()
-        
-        if config_to_delete:
-            try:
-                path = Path(config_to_delete)
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -2393,6 +2378,91 @@ INDEX_HTML = r"""<!doctype html>
       cursor: pointer;
     }
 
+    .routing-select-wrapper {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      max-width: 100%;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--border-color);
+      padding: 0 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      height: 38px;
+      flex: 0 0 auto;
+    }
+
+    .routing-select-wrapper select {
+      width: auto;
+      min-width: 88px;
+      max-width: 220px;
+      height: 30px;
+      background: transparent;
+      border: none;
+      color: var(--text-primary);
+      outline: none;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 0 18px 0 0;
+      box-shadow: none;
+    }
+
+    .routing-select-wrapper select:focus {
+      border: none;
+      box-shadow: none;
+      background: transparent;
+    }
+
+    .protocol-filter-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      height: 42px;
+      padding: 0 12px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      color: var(--text-secondary);
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .protocol-filter-group label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--text-primary);
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .proto-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 48px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      border: 1px solid transparent;
+    }
+
+    .proto-badge.tcp {
+      background: rgba(96, 165, 250, 0.12);
+      color: #93c5fd;
+      border-color: rgba(96, 165, 250, 0.24);
+    }
+
+    .proto-badge.udp {
+      background: rgba(52, 211, 153, 0.12);
+      color: #6ee7b7;
+      border-color: rgba(52, 211, 153, 0.24);
+    }
+
     .toolbar select:focus {
       border-color: var(--primary);
       box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
@@ -2765,21 +2835,21 @@ INDEX_HTML = r"""<!doctype html>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
   <div class="btn-group">
-    <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
+    <div class="routing-select-wrapper">
       <label for="header_routing_country" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">出站国家:</label>
-      <select id="header_routing_country" style="background: transparent; border: none; color: var(--text-primary); outline: none; cursor: pointer; font-size: 13px; font-weight: 600; padding: 0;">
+      <select id="header_routing_country">
         <option value="">智能路由 / 所有</option>
       </select>
     </div>
-    <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
+    <div class="routing-select-wrapper">
       <label for="header_routing_ip_type" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">IP类型:</label>
-      <select id="header_routing_ip_type" style="background: transparent; border: none; color: var(--text-primary); outline: none; cursor: pointer; font-size: 13px; font-weight: 600; padding: 0;">
+      <select id="header_routing_ip_type">
         <option value="all">所有IP类型</option>
         <option value="residential">仅静态住宅IP</option>
         <option value="hosting">仅机房IP</option>
       </select>
     </div>
-    <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
+    <div class="routing-select-wrapper">
       <span style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">协议:</span>
       <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: var(--text-primary);">
         <input type="checkbox" id="header_protocol_tcp" value="tcp" style="accent-color: #22c55e;">
@@ -2887,6 +2957,17 @@ INDEX_HTML = r"""<!doctype html>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
     </select>
+    <div class="protocol-filter-group">
+      <span>展示协议</span>
+      <label>
+        <input type="checkbox" id="list_protocol_tcp" value="tcp" checked style="accent-color: #22c55e;">
+        <span>TCP</span>
+      </label>
+      <label>
+        <input type="checkbox" id="list_protocol_udp" value="udp" checked style="accent-color: #22c55e;">
+        <span>UDP</span>
+      </label>
+    </div>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
     <button id="btn_batch_test" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--primary-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -2908,6 +2989,7 @@ INDEX_HTML = r"""<!doctype html>
             <th>物理位置</th>
             <th style="width: 100px;">ASN</th>
             <th>运营主体 / ISP</th>
+            <th style="width: 90px;">协议</th>
             <th style="width: 110px;">网络质量</th>
             <th style="width: 110px;">IP 类型</th>
             <th style="width: 160px;">操作</th>
@@ -3337,10 +3419,44 @@ function updateCountryFilter() {
   }
 }
 
+function normalizeProtoLabel(proto) {
+  const value = String(proto || "").toLowerCase();
+  if (value.startsWith("tcp")) return "tcp";
+  if (value === "udp") return "udp";
+  return "";
+}
+
+function formatProtoLabel(proto) {
+  const value = normalizeProtoLabel(proto);
+  if (value === "tcp") return "TCP";
+  if (value === "udp") return "UDP";
+  return "-";
+}
+
+function getListDisplayProtocols() {
+  const selected = [];
+  if ($("list_protocol_tcp")?.checked) selected.push("tcp");
+  if ($("list_protocol_udp")?.checked) selected.push("udp");
+  return selected;
+}
+
+function handleListProtocolFilterChange(event) {
+  if (getListDisplayProtocols().length === 0) {
+    alert("列表展示请至少勾选一种协议");
+    if (event && event.target) {
+      event.target.checked = true;
+    }
+    return;
+  }
+  currentPage = 1;
+  render();
+}
+
 function getFilteredNodes() {
   const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
   const selectedIpType = $("ip_type_filter").value;
+  const selectedProtocols = getListDisplayProtocols();
   return nodes.filter(n => {
     if (!n) return false;
     if (selectedCountry && n.country !== selectedCountry) {
@@ -3351,6 +3467,12 @@ function getFilteredNodes() {
         return false;
       }
       if (selectedIpType === "hosting" && n.ip_type !== "hosting") {
+        return false;
+      }
+    }
+    if (selectedProtocols.length > 0) {
+      const proto = normalizeProtoLabel(n.proto);
+      if (!selectedProtocols.includes(proto)) {
         return false;
       }
     }
@@ -3426,6 +3548,7 @@ function render(){
     const latencyClass = getLatencyClass(activeNode.latency_ms);
     const latencyText = activeNode.latency_ms ? `<span class="latency-val ${latencyClass}">${activeNode.latency_ms} ms</span>` : "-";
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
+    const activeProto = formatProtoLabel(activeNode.proto);
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
@@ -3445,6 +3568,7 @@ function render(){
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
+              <span style="margin-left: 12px;">协议: <strong><span class="proto-badge ${esc(normalizeProtoLabel(activeNode.proto) || "udp")}">${esc(activeProto)}</span></strong></span>
             </div>
           </div>
         </div>
@@ -3545,7 +3669,7 @@ function render(){
 
   // Render table rows
   if (currentPageNodes.length === 0) {
-    $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    $("rows").innerHTML = `<tr><td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
@@ -3557,6 +3681,8 @@ function render(){
       const latencyClass = getLatencyClass(n.latency_ms);
       const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
+      const protoClass = normalizeProtoLabel(n.proto) || "udp";
+      const protoText = formatProtoLabel(n.proto);
       
       const isTesting = testingNodeIds.has(n.id);
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
@@ -3576,6 +3702,7 @@ function render(){
         <td>${esc(displayLocation)}</td>
         <td class="mono" style="font-size:12px; color:var(--text-secondary);">${esc(n.asn||"-")}</td>
         <td>${esc(n.owner||n.as_name||"-")}</td>
+        <td><span class="proto-badge ${esc(protoClass)}">${esc(protoText)}</span></td>
         <td>${esc(translateQuality(n.quality))}</td>
         <td>${esc(translateIpType(n.ip_type))}</td>
         <td>
@@ -3955,6 +4082,8 @@ async function load(){
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
+$("list_protocol_tcp").onchange = handleListProtocolFilterChange;
+$("list_protocol_udp").onchange = handleListProtocolFilterChange;
 $("header_routing_country").onchange = saveHeaderRouting;
 $("header_routing_ip_type").onchange = saveHeaderRouting;
 $("header_protocol_tcp").onchange = saveHeaderRouting;
