@@ -132,6 +132,7 @@ server_start_time = time.time()
 mirror_api_urls_cache: list[str] = []
 mirror_api_urls_cache_expires_at = 0.0
 maintain_job_lock = threading.Lock()
+followup_test_lock = threading.Lock()
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -1292,6 +1293,34 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     set_state(last_check_at=time.time(), valid_nodes=valid_nodes)
     return [results_map[node_id] for node_id in node_ids if node_id in results_map]
 
+def schedule_followup_tests(limit: int | None = None) -> None:
+    max_nodes = limit if limit is not None else MAX_MAINTAIN_TEST_NODES
+    if max_nodes <= 0:
+        return
+    if not followup_test_lock.acquire(blocking=False):
+        return
+
+    def worker() -> None:
+        try:
+            with lock:
+                nodes = read_json(NODES_FILE, [])
+                node_ids = [
+                    str(node.get("id") or "")
+                    for node in nodes
+                    if not node.get("active") and node.get("probe_status") == "not_checked"
+                ][:max_nodes]
+            if not node_ids:
+                return
+            log_to_json("INFO", "Main", f"后台续测启动，准备检测 {len(node_ids)} 个待检测节点")
+            test_multiple_nodes(node_ids)
+        except Exception as exc:
+            print(f"[后台续测] 检测待检测节点失败: {exc}", flush=True)
+            log_to_json("WARNING", "Main", f"后台续测失败: {exc}")
+        finally:
+            followup_test_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
 def auto_switch_node(attempt: int = 0) -> None:
     global is_connecting
     if attempt >= 3:
@@ -1451,6 +1480,7 @@ def connect_node(node_id: str) -> str:
             last_check_message=f"节点 {node_id} 已连接",
         )
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功")
+        schedule_followup_tests(MAX_MAINTAIN_TEST_NODES)
         return f"Connected {node_id}"
     finally:
         with lock:
@@ -1562,6 +1592,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
             active_openvpn_node_id=active_openvpn_node_id,
             is_connecting=False,
         )
+        schedule_followup_tests(MAX_MAINTAIN_TEST_NODES)
         return message
     finally:
         with lock:
@@ -1942,6 +1973,9 @@ INDEX_HTML = r"""<!doctype html>
     .btn-group {
       display: flex;
       gap: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      align-items: center;
     }
 
     button, .btn-telegram {
@@ -2073,6 +2107,7 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 13px;
       color: var(--text-secondary);
       flex-wrap: wrap;
+      line-height: 1.5;
     }
 
     .active-card-meta span strong {
@@ -2395,8 +2430,8 @@ INDEX_HTML = r"""<!doctype html>
 
     .routing-select-wrapper select {
       width: auto;
-      min-width: 88px;
-      max-width: 220px;
+      min-width: 0;
+      max-width: 140px;
       height: 30px;
       background: transparent;
       border: none;
@@ -2407,6 +2442,10 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 600;
       padding: 0 18px 0 0;
       box-shadow: none;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+      appearance: none;
     }
 
     .routing-select-wrapper select:focus {
@@ -2415,27 +2454,69 @@ INDEX_HTML = r"""<!doctype html>
       background: transparent;
     }
 
+    #header_routing_country {
+      width: 92px;
+    }
+
+    #header_routing_ip_type {
+      width: 96px;
+    }
+
     .protocol-filter-group {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       height: 42px;
-      padding: 0 12px;
+      padding: 0 10px;
       background: rgba(255, 255, 255, 0.03);
       border: 1px solid var(--border-color);
       border-radius: 8px;
       color: var(--text-secondary);
       font-size: 13px;
       font-weight: 500;
+      flex: 0 0 auto;
+      white-space: nowrap;
     }
 
-    .protocol-filter-group label {
+    .protocol-filter-title {
+      color: var(--text-secondary);
+      font-weight: 500;
+      margin-right: 2px;
+    }
+
+    .protocol-toggle {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
-      color: var(--text-primary);
+      justify-content: center;
+      min-width: 46px;
+      height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text-secondary);
       cursor: pointer;
       font-weight: 600;
+      font-size: 12px;
+      transition: all 0.2s ease;
+      box-sizing: border-box;
+    }
+
+    .protocol-toggle.active {
+      background: rgba(52, 211, 153, 0.14);
+      color: #6ee7b7;
+      border-color: rgba(52, 211, 153, 0.28);
+      box-shadow: inset 0 0 0 1px rgba(52, 211, 153, 0.08);
+    }
+
+    .protocol-toggle:hover {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-primary);
+    }
+
+    .protocol-toggle.active:hover {
+      background: rgba(52, 211, 153, 0.18);
+      color: #86efac;
     }
 
     .proto-badge {
@@ -2449,6 +2530,11 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 700;
       letter-spacing: 0.3px;
       border: 1px solid transparent;
+      white-space: nowrap;
+    }
+
+    .nowrap-cell {
+      white-space: nowrap;
     }
 
     .proto-badge.tcp {
@@ -2508,13 +2594,17 @@ INDEX_HTML = r"""<!doctype html>
       width: 100%;
       border-collapse: collapse;
       text-align: left;
-      min-width: 1000px;
+      min-width: 1320px;
     }
 
     th, td {
       padding: 14px 20px;
       border-bottom: 1px solid var(--border-color);
       font-size: 14px;
+      vertical-align: middle;
+      line-height: 1.45;
+      white-space: normal;
+      word-break: keep-all;
     }
 
     th {
@@ -2556,6 +2646,7 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       gap: 6px;
       border: 1px solid transparent;
+      white-space: nowrap;
     }
 
     .badge-pulse {
@@ -2838,13 +2929,13 @@ INDEX_HTML = r"""<!doctype html>
     <div class="routing-select-wrapper">
       <label for="header_routing_country" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">出站国家:</label>
       <select id="header_routing_country">
-        <option value="">智能路由 / 所有</option>
+        <option value="">全部</option>
       </select>
     </div>
     <div class="routing-select-wrapper">
       <label for="header_routing_ip_type" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">IP类型:</label>
       <select id="header_routing_ip_type">
-        <option value="all">所有IP类型</option>
+        <option value="all">全部IP</option>
         <option value="residential">仅静态住宅IP</option>
         <option value="hosting">仅机房IP</option>
       </select>
@@ -2958,15 +3049,9 @@ INDEX_HTML = r"""<!doctype html>
       <option value="hosting">机房IP</option>
     </select>
     <div class="protocol-filter-group">
-      <span>展示协议</span>
-      <label>
-        <input type="checkbox" id="list_protocol_tcp" value="tcp" checked style="accent-color: #22c55e;">
-        <span>TCP</span>
-      </label>
-      <label>
-        <input type="checkbox" id="list_protocol_udp" value="udp" checked style="accent-color: #22c55e;">
-        <span>UDP</span>
-      </label>
+      <span class="protocol-filter-title">展示协议</span>
+      <button type="button" id="list_protocol_tcp" class="protocol-toggle active" data-proto="tcp">TCP</button>
+      <button type="button" id="list_protocol_udp" class="protocol-toggle active" data-proto="udp">UDP</button>
     </div>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
     <button id="btn_batch_test" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--primary-gradient);">
@@ -2984,11 +3069,11 @@ INDEX_HTML = r"""<!doctype html>
         <thead>
           <tr>
             <th style="width: 110px;">状态</th>
-            <th style="width: 100px;">延迟</th>
+            <th style="width: 92px;">延迟</th>
             <th style="width: 220px;">IP 地址 : 端口</th>
-            <th>物理位置</th>
-            <th style="width: 100px;">ASN</th>
-            <th>运营主体 / ISP</th>
+            <th style="width: 220px;">物理位置</th>
+            <th style="width: 220px;">ASN</th>
+            <th style="width: 180px;">运营主体 / ISP</th>
             <th style="width: 90px;">协议</th>
             <th style="width: 110px;">网络质量</th>
             <th style="width: 110px;">IP 类型</th>
@@ -3433,21 +3518,28 @@ function formatProtoLabel(proto) {
   return "-";
 }
 
+function setProtocolToggleState(button, enabled) {
+  if (!button) return;
+  button.classList.toggle("active", !!enabled);
+  button.setAttribute("aria-pressed", enabled ? "true" : "false");
+}
+
 function getListDisplayProtocols() {
   const selected = [];
-  if ($("list_protocol_tcp")?.checked) selected.push("tcp");
-  if ($("list_protocol_udp")?.checked) selected.push("udp");
+  if ($("list_protocol_tcp")?.classList.contains("active")) selected.push("tcp");
+  if ($("list_protocol_udp")?.classList.contains("active")) selected.push("udp");
   return selected;
 }
 
 function handleListProtocolFilterChange(event) {
-  if (getListDisplayProtocols().length === 0) {
-    alert("列表展示请至少勾选一种协议");
-    if (event && event.target) {
-      event.target.checked = true;
-    }
+  const button = event?.currentTarget;
+  if (!button) return;
+  const nextActive = !button.classList.contains("active");
+  if (!nextActive && getListDisplayProtocols().length <= 1) {
+    alert("列表展示请至少保留一种协议");
     return;
   }
+  setProtocolToggleState(button, nextActive);
   currentPage = 1;
   render();
 }
@@ -3698,13 +3790,13 @@ function render(){
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td>${latencyText}</td>
-        <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono nowrap-cell">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
         <td>${esc(displayLocation)}</td>
         <td class="mono" style="font-size:12px; color:var(--text-secondary);">${esc(n.asn||"-")}</td>
         <td>${esc(n.owner||n.as_name||"-")}</td>
         <td><span class="proto-badge ${esc(protoClass)}">${esc(protoText)}</span></td>
-        <td>${esc(translateQuality(n.quality))}</td>
-        <td>${esc(translateIpType(n.ip_type))}</td>
+        <td class="nowrap-cell">${esc(translateQuality(n.quality))}</td>
+        <td class="nowrap-cell">${esc(translateIpType(n.ip_type))}</td>
         <td>
           <div class="table-actions">
             ${testBtn}
@@ -3902,63 +3994,53 @@ $("btn_batch_test").onclick = async () => {
 // 新增：批量测试所有获取到节点的实现逻辑
 // ==========================================
 $("btn_batch_test_all").onclick = async () => {
-  // 1. 获取本地存储的所有备选节点
-  const allNodes = nodes || [];
-  if (allNodes.length === 0) {
-    alert("当前没有获取到任何备选节点，请先等待列表加载。");
+  const filteredNodes = getFilteredNodes();
+  const filteredIds = filteredNodes.map(node => node.id).filter(Boolean);
+  if (filteredIds.length === 0) {
+    alert("当前筛选结果里没有可测试的节点。");
     return;
   }
-  
+
   const btn = $("btn_batch_test_all");
-  btn.disabled = true; // 防止用户重复点击
-  const originalHtml = btn.innerHTML; // 保存原本按钮的文字和图标
-  
-  // 按钮切换为动态的加载中状态
-  btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width: 14px; height: 14px; display: inline-block; margin-right: 6px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>全部测试中...`;
-
-  // 2. 将所有节点在界面上先标记为“检测中”
-  allNodes.forEach(n => testingNodeIds.add(n.id));
-  render();
-
-  // 提取出所有节点的 ID，准备发送给后台
-  const allIds = allNodes.map(n => n.id);
-  
-  // 3. 核心分批逻辑：为了防止一次性测试几千个节点导致请求超时，我们每次向后端发送 50 个节点进行测试
+  const originalHtml = btn.innerHTML;
   const chunkSize = 50;
 
-  for (let i = 0; i < allIds.length; i += chunkSize) {
-    const chunkIds = allIds.slice(i, i + chunkSize);
-    try {
-      // 调用后端的批量测试 API (/api/test_nodes)
-      const response = await fetch("./api/test_nodes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: chunkIds })
-      });
-      const result = await response.json();
+  btn.disabled = true;
+  btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width: 14px; height: 14px; display: inline-block; margin-right: 6px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>测试筛选节点中...`;
 
-      // 如果这 50 个节点测试完成了，就在前端更新它们的数据
-      if (result.ok && result.nodes) {
-        result.nodes.forEach(updatedNode => {
-          // 找到当前列表中对应的节点并覆盖其状态和延迟
-          const idx = nodes.findIndex(item => item.id === updatedNode.id);
-          if (idx !== -1) {
-            nodes[idx] = updatedNode; 
-          }
+  filteredIds.forEach(id => testingNodeIds.add(id));
+  render();
+
+  try {
+    for (let i = 0; i < filteredIds.length; i += chunkSize) {
+      const chunkIds = filteredIds.slice(i, i + chunkSize);
+      try {
+        const response = await fetch("./api/test_nodes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids: chunkIds })
         });
-      }
-    } catch (e) {
-      console.error("批量测试请求失败:", e);
-    } finally {
-      // 无论这批成功还是失败，都将它们从转圈的“检测中”状态移除
-      chunkIds.forEach(id => testingNodeIds.delete(id));
-      render(); // 刷新一下界面，让用户能看到一部分节点已经测试完毕变色了
-    }
-  }
+        const result = await response.json();
 
-  // 4. 全部循环执行完毕，恢复按钮为可点击状态
-  btn.disabled = false;
-  btn.innerHTML = originalHtml;
+        if (result.ok && Array.isArray(result.nodes)) {
+          result.nodes.forEach(updatedNode => {
+            const idx = nodes.findIndex(item => item.id === updatedNode.id);
+            if (idx !== -1) {
+              nodes[idx] = updatedNode;
+            }
+          });
+        }
+      } catch (e) {
+        console.error("批量测试筛选节点失败:", e);
+      } finally {
+        chunkIds.forEach(id => testingNodeIds.delete(id));
+        render();
+      }
+    }
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
+  }
 };
 
 function updateHeaderRoutingControls() {
@@ -3975,13 +4057,13 @@ function updateHeaderRoutingControls() {
   const currentTexts = Array.from(selectCountry.options)
     .filter(o => o.value && o.value !== "fixed_ip_mode")
     .map(o => o.textContent || "");
-  const nextTexts = countries.map(c => `${c} (${countMap[c]}个节点)`);
+  const nextTexts = countries.map(c => c);
   
   const rebuild = JSON.stringify(countries) !== JSON.stringify(currentOptions) ||
     JSON.stringify(nextTexts) !== JSON.stringify(currentTexts);
   if (rebuild) {
-    selectCountry.innerHTML = '<option value="">智能路由 / 所有</option>' + 
-      countries.map(c => `<option value="${esc(c)}">${esc(c)} (${countMap[c]}个节点)</option>`).join("");
+    selectCountry.innerHTML = '<option value="">全部</option>' + 
+      countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
   }
   
   // 2. Set value
@@ -4011,6 +4093,8 @@ function updateHeaderRoutingControls() {
   const enabledProtocols = Array.isArray(state.routing_protocol) ? state.routing_protocol : [];
   protocolTcp.checked = enabledProtocols.includes("tcp");
   protocolUdp.checked = enabledProtocols.includes("udp");
+  protocolTcp.parentElement.style.opacity = protocolTcp.checked ? "1" : "0.72";
+  protocolUdp.parentElement.style.opacity = protocolUdp.checked ? "1" : "0.72";
 }
 
 async function saveHeaderRouting() {
@@ -4082,8 +4166,8 @@ async function load(){
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
-$("list_protocol_tcp").onchange = handleListProtocolFilterChange;
-$("list_protocol_udp").onchange = handleListProtocolFilterChange;
+$("list_protocol_tcp").onclick = handleListProtocolFilterChange;
+$("list_protocol_udp").onclick = handleListProtocolFilterChange;
 $("header_routing_country").onchange = saveHeaderRouting;
 $("header_routing_ip_type").onchange = saveHeaderRouting;
 $("header_protocol_tcp").onchange = saveHeaderRouting;
