@@ -200,6 +200,14 @@ else
     echo -e "${YELLOW}警告: 未能检测到 systemd 或 OpenRC，请手动管理服务。${PLAIN}"
 fi
 
+echo -e "  -> 正在写入服务环境文件 /etc/default/aimilivpn ..."
+cat > /etc/default/aimilivpn <<EOF
+# AimiliVPN 服务默认环境变量
+VPNGATE_DATA_DIR=${INSTALL_DIR}/vpngate_data
+LOCAL_PROXY_HOST=0.0.0.0
+UI_HOST=::
+EOF
+
 # 6. Configure global command shortcut "ml"
 echo -e "\n${YELLOW}[4/4] 正在创建全局命令快捷接口 'ml'...${PLAIN}"
 echo -e "  -> 正在写入管理脚本 /usr/bin/ml ..."
@@ -297,6 +305,46 @@ def get_active_node_info():
         except Exception:
             pass
     return None, None
+
+def get_proxy_access_endpoints(state, proxy_port):
+    import urllib.parse
+    local_proxy = state.get("local_proxy", f"http://0.0.0.0:{proxy_port}")
+    try:
+        parsed = urllib.parse.urlsplit(local_proxy)
+        proxy_host = parsed.hostname or "0.0.0.0"
+        proxy_port = parsed.port or proxy_port
+    except Exception:
+        proxy_host = "0.0.0.0"
+
+    if proxy_host in ("0.0.0.0", "", "::"):
+        public_host = get_public_ip()
+        return {
+            "public_url": f"http://{public_host}:{proxy_port}" if public_host else "",
+            "local_url": f"http://127.0.0.1:{proxy_port}",
+            "local_socks_host": "127.0.0.1",
+        }
+    if proxy_host in ("127.0.0.1", "localhost"):
+        return {
+            "public_url": "",
+            "local_url": f"http://127.0.0.1:{proxy_port}",
+            "local_socks_host": "127.0.0.1",
+        }
+    if proxy_host == "::1":
+        return {
+            "public_url": "",
+            "local_url": f"http://[::1]:{proxy_port}",
+            "local_socks_host": "[::1]",
+        }
+    if ":" in proxy_host:
+        proxy_url = f"http://[{proxy_host}]:{proxy_port}"
+        proxy_host = f"[{proxy_host}]"
+    else:
+        proxy_url = f"http://{proxy_host}:{proxy_port}"
+    return {
+        "public_url": proxy_url,
+        "local_url": proxy_url,
+        "local_socks_host": proxy_host,
+    }
 
 def ping_ip(ip):
     if not ip:
@@ -467,6 +515,12 @@ def print_status():
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
+    proxy_endpoints = get_proxy_access_endpoints(state, proxy_port)
+    proxy_entry = state.get("proxy_entry") or proxy_endpoints["public_url"] or proxy_endpoints["local_url"]
+    print_line(format_line("代理入口(当前)", f"{yellow}{proxy_entry}/{reset}"))
+    if proxy_endpoints["public_url"] and proxy_endpoints["public_url"] != proxy_entry:
+        print_line(format_line("代理入口(公网)", f"{yellow}{proxy_endpoints['public_url']}/{reset}"))
+    print_line(format_line("代理入口(本机调试)", f"{yellow}{proxy_endpoints['local_url']}/{reset}"))
     print_line()
     print_line("【活动节点状态】")
     if is_connecting:
@@ -482,16 +536,16 @@ def print_status():
         print_line(format_line("节点延迟 (直连测试)", latency))
         if proxy_ok and proxy_ip and proxy_ip != "-":
             print_line(format_line("出口 IP (出站)", proxy_ip))
-            print_line(format_line("本地代理延迟", f"{proxy_latency} ms" if proxy_latency else "检测中..."))
+            print_line(format_line("代理出口延迟", f"{proxy_latency} ms" if proxy_latency else "检测中..."))
         else:
             proxy_err = state.get("proxy_error") or "检测中/未就绪"
             print_line(format_line("出口 IP (出站)", f"{red}[不可用 - {proxy_err}]{reset}"))
     else:
         print_line(format_line("节点状态", "无活动连接"))
     print_line()
-    print_line("【使用方法】")
-    print_line(f"  export http_proxy=socks5://{login_ip}:{proxy_port}")
-    print_line(f"  export https_proxy=socks5://{login_ip}:{proxy_port}")
+    print_line("【本机命令行使用】")
+    print_line(f"  export http_proxy=socks5://{proxy_endpoints['local_socks_host']}:{proxy_port}")
+    print_line(f"  export https_proxy=socks5://{proxy_endpoints['local_socks_host']}:{proxy_port}")
     print_line("=======================================================")
 
 def run_service_cmd(cmd):
@@ -591,29 +645,67 @@ def update_service():
         print(f"未找到安装目录: {INSTALL_DIR}")
         time.sleep(2)
 
+def remove_path(path):
+    try:
+        if os.path.islink(path) or os.path.isfile(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception as e:
+        print(f"[卸载提示] 删除 {path} 失败: {e}")
+        return False
+
 def uninstall_service():
     confirm = input("确定要完全卸载 AimiliVPN 吗？(y/N): ")
     if confirm.lower() == 'y':
-        print("正在完全卸载 AimiliVPN...", flush=True)
+        print(f"正在完全卸载 AimiliVPN...", flush=True)
+        print(f"安装目录就是: {INSTALL_DIR}", flush=True)
         stop_service()
         if shutil.which("systemctl"):
-            subprocess.run(["systemctl", "disable", "aimilivpn.service"])
-            try:
-                os.unlink("/lib/systemd/system/aimilivpn.service")
-            except Exception:
-                pass
+            subprocess.run(["systemctl", "disable", "--now", "aimilivpn.service"], check=False)
+            subprocess.run(["systemctl", "stop", "aimilivpn.service"], check=False)
+            remove_path("/lib/systemd/system/aimilivpn.service")
+            remove_path("/etc/systemd/system/aimilivpn.service")
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+            subprocess.run(["systemctl", "reset-failed", "aimilivpn.service"], check=False)
         elif shutil.which("rc-service"):
-            subprocess.run(["rc-update", "del", "aimilivpn"])
+            subprocess.run(["rc-service", "aimilivpn", "stop"], check=False)
+            subprocess.run(["rc-update", "del", "aimilivpn"], check=False)
+            remove_path("/etc/init.d/aimilivpn")
+        subprocess.run(["pkill", "-f", "openvpn.*tun0"], check=False)
+        subprocess.run(["pkill", "-f", "openvpn.*vpngate_data"], check=False)
+        subprocess.run(["pkill", "-f", "vpngate_manager.py"], check=False)
+        subprocess.run(["pkill", "-f", INSTALL_DIR], check=False)
+        remove_path("/usr/bin/ml")
+        remove_path("/etc/default/aimilivpn")
+        remove_path("/etc/sysctl.d/99-aimilivpn.conf")
+        remove_path("/run/aimilivpn.pid")
+        if os.path.exists("/etc/sysctl.conf"):
             try:
-                os.unlink("/etc/init.d/aimilivpn")
-            except Exception:
-                pass
-        try:
-            os.unlink("/usr/bin/ml")
-        except Exception:
-            pass
-        subprocess.run(["rm", "-rf", INSTALL_DIR])
-        print("AimiliVPN 已卸载！")
+                with open("/etc/sysctl.conf", "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                filtered = [
+                    line for line in lines
+                    if "net.ipv4.conf.all.rp_filter = 2" not in line
+                    and "net.ipv4.conf.default.rp_filter = 2" not in line
+                ]
+                if filtered != lines:
+                    with open("/etc/sysctl.conf", "w", encoding="utf-8") as f:
+                        f.writelines(filtered)
+            except Exception as e:
+                print(f"[卸载提示] 清理 /etc/sysctl.conf 中的 AimiliVPN 配置失败: {e}")
+        remove_path(INSTALL_DIR)
+        if os.path.exists(INSTALL_DIR):
+            print(f"[卸载提示] 检测到目录仍存在，正在再次清理: {INSTALL_DIR}", flush=True)
+            time.sleep(1)
+            remove_path(INSTALL_DIR)
+        if os.path.exists(INSTALL_DIR):
+            print(f"[卸载警告] 安装目录仍未删除，请手动执行: rm -rf {INSTALL_DIR}")
+        else:
+            print(f"AimiliVPN 已卸载，安装目录 {INSTALL_DIR} 已删除。")
         sys.exit(0)
     else:
         print("已取消卸载。")
@@ -1202,7 +1294,12 @@ if [ -n "$PUBLIC_IPV6" ]; then
 fi
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
-echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${PLAIN}  或  ${BLUE}http://[::1]:${PROXY_PORT}/${PLAIN}"
+echo -e "  * HTTP/SOCKS5 代理入口(公网):  ${BLUE}http://${PUBLIC_IP}:${PROXY_PORT}/${PLAIN}"
+if [ -n "$PUBLIC_IPV6" ]; then
+    echo -e "  * HTTP/SOCKS5 代理入口(IPv6):  ${BLUE}http://[${PUBLIC_IPV6}]:${PROXY_PORT}/${PLAIN}"
+fi
+echo -e "  * 本机调试入口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${PLAIN}  或  ${BLUE}http://[::1]:${PROXY_PORT}/${PLAIN}"
+echo -e "  * 安装目录:  ${YELLOW}${INSTALL_DIR}${PLAIN}"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
