@@ -1118,6 +1118,24 @@ def release_test_index(idx: int) -> None:
     with test_indexes_lock:
         active_test_indexes.discard(idx)
 
+def set_node_testing_state(node_ids: list[str], is_testing: bool) -> None:
+    normalized_ids = {str(node_id or "") for node_id in node_ids if str(node_id or "")}
+    if not normalized_ids:
+        return
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        changed = False
+        for item in nodes:
+            node_id = str(item.get("id") or "")
+            if node_id not in normalized_ids:
+                continue
+            if bool(item.get("is_testing")) == is_testing:
+                continue
+            item["is_testing"] = is_testing
+            changed = True
+        if changed:
+            write_json(NODES_FILE, nodes)
+
 def test_node_by_id(node_id: str) -> dict[str, Any]:
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -1312,7 +1330,11 @@ def schedule_followup_tests(limit: int | None = None) -> None:
             if not node_ids:
                 return
             log_to_json("INFO", "Main", f"后台续测启动，准备检测 {len(node_ids)} 个待检测节点")
-            test_multiple_nodes(node_ids)
+            set_node_testing_state(node_ids, True)
+            try:
+                test_multiple_nodes(node_ids)
+            finally:
+                set_node_testing_state(node_ids, False)
         except Exception as exc:
             print(f"[后台续测] 检测待检测节点失败: {exc}", flush=True)
             log_to_json("WARNING", "Main", f"后台续测失败: {exc}")
@@ -2496,13 +2518,20 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(255, 255, 255, 0.03);
       color: var(--text-secondary);
       cursor: pointer;
-      font-weight: 600;
+      font-weight: 700;
       font-size: 12px;
       transition: all 0.2s ease;
       box-sizing: border-box;
     }
 
-    .protocol-toggle.active {
+    .protocol-toggle[data-proto="tcp"].active {
+      background: rgba(96, 165, 250, 0.14);
+      color: #93c5fd;
+      border-color: rgba(96, 165, 250, 0.3);
+      box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.1);
+    }
+
+    .protocol-toggle[data-proto="udp"].active {
       background: rgba(52, 211, 153, 0.14);
       color: #6ee7b7;
       border-color: rgba(52, 211, 153, 0.28);
@@ -2514,7 +2543,12 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-primary);
     }
 
-    .protocol-toggle.active:hover {
+    .protocol-toggle[data-proto="tcp"].active:hover {
+      background: rgba(96, 165, 250, 0.2);
+      color: #bfdbfe;
+    }
+
+    .protocol-toggle[data-proto="udp"].active:hover {
       background: rgba(52, 211, 153, 0.18);
       color: #86efac;
     }
@@ -2755,10 +2789,20 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .latency-val {
-      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      white-space: nowrap;
+      font-weight: 700;
       padding: 2px 6px;
       border-radius: 4px;
       font-size: 12px;
+      line-height: 1;
+    }
+
+    .latency-cell {
+      white-space: nowrap;
     }
 
     .latency-good {
@@ -3524,6 +3568,27 @@ function setProtocolToggleState(button, enabled) {
   button.setAttribute("aria-pressed", enabled ? "true" : "false");
 }
 
+function getNodeSyncPaused() {
+  return Boolean(state?.is_connecting) || Boolean(testingNodeIds?.size);
+}
+
+async function syncNodes(options = {}) {
+  const { renderAfter = true, updateFilters = true } = options;
+  const response = await fetch("./api/nodes");
+  const data = await response.json();
+  nodes = data.nodes || [];
+  state = data.state || {};
+  stableSortNodes();
+  if (updateFilters) {
+    updateCountryFilter();
+    updateHeaderRoutingControls();
+  }
+  if (renderAfter) {
+    render();
+  }
+  return data;
+}
+
 function getListDisplayProtocols() {
   const selected = [];
   if ($("list_protocol_tcp")?.classList.contains("active")) selected.push("tcp");
@@ -3771,12 +3836,12 @@ function render(){
       const badgeClass = isCurrentlyActive ? 'available' : (n.probe_status || 'not_checked');
       const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(n.probe_status);
       const latencyClass = getLatencyClass(n.latency_ms);
-      const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
+      const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms}&nbsp;ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
       const protoClass = normalizeProtoLabel(n.proto) || "udp";
       const protoText = formatProtoLabel(n.proto);
       
-      const isTesting = testingNodeIds.has(n.id);
+      const isTesting = testingNodeIds.has(n.id) || Boolean(n.is_testing);
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
       const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
@@ -3789,10 +3854,10 @@ function render(){
       
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td>${latencyText}</td>
+        <td class="latency-cell">${latencyText}</td>
         <td class="mono nowrap-cell">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
         <td>${esc(displayLocation)}</td>
-        <td class="mono" style="font-size:12px; color:var(--text-secondary);">${esc(n.asn||"-")}</td>
+        <td class="mono" style="font-size:12px; color:var(--text-primary);">${esc(n.asn||"-")}</td>
         <td>${esc(n.owner||n.as_name||"-")}</td>
         <td><span class="proto-badge ${esc(protoClass)}">${esc(protoText)}</span></td>
         <td class="nowrap-cell">${esc(translateQuality(n.quality))}</td>
@@ -3856,7 +3921,11 @@ async function testNode(btn, id, event){
   } catch (e) {
   } finally {
     testingNodeIds.delete(id);
-    render();
+    try {
+      await syncNodes();
+    } catch (syncError) {
+      render();
+    }
   }
 }
 
@@ -3866,12 +3935,7 @@ function startConnectionPolling() {
   if (pollInterval) clearInterval(pollInterval);
   pollInterval = setInterval(async () => {
     try {
-      const resp = await fetch("./api/nodes");
-      const data = await resp.json();
-      nodes = data.nodes || [];
-      state = data.state || {};
-      stableSortNodes();
-      render();
+      await syncNodes();
       
       if (!state.is_connecting) {
         clearInterval(pollInterval);
@@ -3985,6 +4049,11 @@ $("btn_batch_test").onclick = async () => {
     await Promise.all(testPromises);
   } catch (e) {
   } finally {
+    try {
+      await syncNodes();
+    } catch (syncError) {
+      render();
+    }
     btn.disabled = false;
     btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> 批量测试本页`;
   }
@@ -4038,6 +4107,11 @@ $("btn_batch_test_all").onclick = async () => {
       }
     }
   } finally {
+    try {
+      await syncNodes();
+    } catch (syncError) {
+      render();
+    }
     btn.disabled = false;
     btn.innerHTML = originalHtml;
   }
@@ -4148,15 +4222,7 @@ async function saveHeaderRouting() {
 }
 
 async function load(){
-  const r=await fetch("./api/nodes"); 
-  const d=await r.json(); 
-  nodes=d.nodes||[]; 
-  state=d.state||{}; 
-  
-  stableSortNodes();
-  updateCountryFilter();
-  updateHeaderRoutingControls();
-  render();
+  await syncNodes();
 
   if (state.is_connecting) {
     startConnectionPolling();
@@ -4514,19 +4580,15 @@ async function logoutAdmin() {
 // 页面加载时自动初始化数据
 load();
 
-// 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
+// 前台空闲时自动同步节点与状态，待检测完成后会自动刷新展示
 setInterval(async () => {
-  if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
-    try {
-      const r = await fetch("./api/nodes");
-      const d = await r.json();
-      nodes = d.nodes || [];
-      state = d.state || {};
-      stableSortNodes();
-      render();
-    } catch(e) {}
+  if (document.visibilityState !== "visible" || getNodeSyncPaused()) {
+    return;
   }
-}, 10000);
+  try {
+    await syncNodes();
+  } catch (e) {}
+}, 3000);
 let gatewayPollInterval = null;
 
 function openGatewayModal() {
