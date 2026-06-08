@@ -107,6 +107,9 @@ MAX_CONCURRENT_TEST_WORKERS = int(os.environ.get("MAX_CONCURRENT_TEST_WORKERS", 
 MAX_BATCH_TEST_REQUEST_SIZE = int(os.environ.get("MAX_BATCH_TEST_REQUEST_SIZE", "12"))
 MAX_MAINTAIN_TEST_NODES = int(os.environ.get("MAX_MAINTAIN_TEST_NODES", "12"))
 FOLLOWUP_TEST_BATCH_SIZE = int(os.environ.get("FOLLOWUP_TEST_BATCH_SIZE", "5"))
+SOURCE_SCAN_CANDIDATE_LIMIT = int(os.environ.get("SOURCE_SCAN_CANDIDATE_LIMIT", "10"))
+FETCH_SOURCE_LIMIT = int(os.environ.get("FETCH_SOURCE_LIMIT", "5"))
+SOURCE_DELETE_FAILURE_THRESHOLD = int(os.environ.get("SOURCE_DELETE_FAILURE_THRESHOLD", "3"))
 MANUAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("MANUAL_TEST_TIMEOUT_SECONDS", "8"))
 KEEP_OLD_NODE_LATENCY_MS = int(os.environ.get("KEEP_OLD_NODE_LATENCY_MS", "50"))
 MAX_CACHED_NODES = int(os.environ.get("MAX_CACHED_NODES", "1200"))
@@ -116,6 +119,7 @@ DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPN
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
+SOURCES_FILE = DATA_DIR / "api_sources.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 
 lock = threading.RLock()
@@ -136,6 +140,8 @@ mirror_api_urls_cache: list[str] = []
 mirror_api_urls_cache_expires_at = 0.0
 maintain_job_lock = threading.Lock()
 followup_test_lock = threading.Lock()
+source_scan_lock = threading.Lock()
+heavy_task_lock = threading.RLock()
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -146,6 +152,33 @@ def ensure_dirs() -> None:
             AUTH_FILE.chmod(0o600)
         except OSError:
             pass
+    if not SOURCES_FILE.exists():
+        write_json(
+            SOURCES_FILE,
+            {
+                "use_selected_only": False,
+                "last_scan_at": 0.0,
+                "last_scan_date": "",
+                "last_scan_message": "",
+                "sources": [
+                    {
+                        "url": API_URL,
+                        "type": "system",
+                        "enabled": True,
+                        "selected": True,
+                        "healthy": False,
+                        "status": "待扫描",
+                        "consecutive_failures": 0,
+                        "success_count": 0,
+                        "failure_count": 0,
+                        "last_error": "",
+                        "last_http_code": 0,
+                        "last_checked_at": 0.0,
+                        "last_success_at": 0.0,
+                    }
+                ],
+            },
+        )
 
 def save_node_config(config_path: Path, config_text: str) -> None:
     CONFIG_DIR.mkdir(exist_ok=True, parents=True)
@@ -388,7 +421,431 @@ def get_state() -> dict[str, Any]:
     state["routing_protocol"] = normalize_routing_protocols(ui_cfg.get("routing_protocol", ["udp"]))
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
+    source_pool = load_source_pool()
+    state["source_use_selected_only"] = source_pool.get("use_selected_only", False)
+    state["source_last_scan_at"] = float(source_pool.get("last_scan_at", 0) or 0)
+    state["source_last_scan_message"] = str(source_pool.get("last_scan_message", "") or "")
+    state["source_total_count"] = len(source_pool.get("sources", []))
+    state["healthy_source_count"] = len([item for item in source_pool.get("sources", []) if item.get("healthy")])
     return state
+
+def normalize_source_url(url: Any) -> str:
+    text = str(url or "").strip()
+    if not text or not re.match(r"^https?://", text, re.IGNORECASE):
+        return ""
+    text = text.rstrip("/")
+    lowered = text.lower()
+    if lowered.endswith("/api/iphone"):
+        return text + "/"
+    if "/api/iphone/" in lowered:
+        idx = lowered.find("/api/iphone/")
+        return text[:idx] + "/api/iphone/"
+    return text + "/api/iphone/"
+
+def default_source_entry(url: str, source_type: str = "mirror") -> dict[str, Any]:
+    return {
+        "url": url,
+        "type": source_type,
+        "enabled": True,
+        "selected": source_type in ("system", "manual"),
+        "healthy": False,
+        "status": "待扫描",
+        "consecutive_failures": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "last_error": "",
+        "last_http_code": 0,
+        "last_checked_at": 0.0,
+        "last_success_at": 0.0,
+    }
+
+def source_type_order(source_type: Any) -> int:
+    if source_type == "system":
+        return 0
+    if source_type == "manual":
+        return 1
+    return 2
+
+def sort_source_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        entries,
+        key=lambda item: (
+            0 if item.get("healthy") else 1,
+            source_type_order(item.get("type")),
+            0 if item.get("selected") else 1,
+            -float(item.get("last_success_at", 0) or 0),
+            str(item.get("url") or ""),
+        ),
+    )
+
+def load_source_pool() -> dict[str, Any]:
+    try:
+        raw = read_json(SOURCES_FILE, {})
+    except Exception:
+        raw = {}
+
+    entries_by_url: dict[str, dict[str, Any]] = {}
+    raw_sources = raw.get("sources", [])
+    if not isinstance(raw_sources, list):
+        raw_sources = []
+
+    for item in raw_sources:
+        if not isinstance(item, dict):
+            continue
+        url = normalize_source_url(item.get("url"))
+        if not url:
+            continue
+        source_type = str(item.get("type") or "mirror").strip().lower()
+        if source_type not in ("system", "manual", "mirror"):
+            source_type = "mirror"
+        entry = default_source_entry(url, source_type)
+        entry["enabled"] = bool(item.get("enabled", True))
+        entry["selected"] = bool(item.get("selected", entry["selected"]))
+        entry["healthy"] = bool(item.get("healthy", False))
+        entry["status"] = str(item.get("status") or "待扫描")
+        entry["consecutive_failures"] = max(0, parse_int(item.get("consecutive_failures")))
+        entry["success_count"] = max(0, parse_int(item.get("success_count")))
+        entry["failure_count"] = max(0, parse_int(item.get("failure_count")))
+        entry["last_error"] = str(item.get("last_error") or "")
+        entry["last_http_code"] = max(0, parse_int(item.get("last_http_code")))
+        entry["last_checked_at"] = float(item.get("last_checked_at", 0) or 0)
+        entry["last_success_at"] = float(item.get("last_success_at", 0) or 0)
+        entries_by_url[url] = entry
+
+    system_url = normalize_source_url(API_URL)
+    if system_url and system_url not in entries_by_url:
+        entries_by_url[system_url] = default_source_entry(system_url, "system")
+
+    return {
+        "use_selected_only": bool(raw.get("use_selected_only", False)),
+        "last_scan_at": float(raw.get("last_scan_at", 0) or 0),
+        "last_scan_date": str(raw.get("last_scan_date") or ""),
+        "last_scan_message": str(raw.get("last_scan_message") or ""),
+        "sources": sort_source_entries(list(entries_by_url.values())),
+    }
+
+def save_source_pool(pool: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "use_selected_only": bool(pool.get("use_selected_only", False)),
+        "last_scan_at": float(pool.get("last_scan_at", 0) or 0),
+        "last_scan_date": str(pool.get("last_scan_date") or ""),
+        "last_scan_message": str(pool.get("last_scan_message") or ""),
+        "sources": sort_source_entries(list(pool.get("sources", []))),
+    }
+    write_json(SOURCES_FILE, normalized)
+    return normalized
+
+def looks_like_vpngate_csv(text: str) -> bool:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("*"):
+            continue
+        if line.startswith("#"):
+            line = line[1:]
+        return all(key in line for key in ("HostName", "IP", "Score", "OpenVPN_ConfigData_Base64"))
+    return False
+
+def parse_http_code_from_error(exc: Exception) -> int:
+    text = str(exc)
+    match = re.search(r"(?:HTTP Error|status)\s+(\d{3})", text, re.IGNORECASE)
+    return int(match.group(1)) if match else 0
+
+def probe_api_source(source_url: str) -> dict[str, Any]:
+    started_at = time.time()
+    try:
+        text = fetch_api_text(source_url, use_ssl_verify=source_url.startswith("https://"))
+        if not looks_like_vpngate_csv(text):
+            raise RuntimeError("返回内容不是 api/iphone CSV")
+        return {
+            "ok": True,
+            "http_code": 200,
+            "error": "",
+            "checked_at": started_at,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "http_code": parse_http_code_from_error(exc),
+            "error": str(exc),
+            "checked_at": started_at,
+        }
+
+def source_page_urls() -> list[str]:
+    raw_urls = [MIRROR_SITES_URL]
+    if MIRROR_SITES_URLS:
+        raw_urls.extend(re.split(r"[\s,]+", MIRROR_SITES_URLS.strip()))
+    seen: set[str] = set()
+    urls: list[str] = []
+    for item in raw_urls:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        urls.append(text)
+    return urls
+
+def load_mirror_site_urls() -> list[str]:
+    if not ENABLE_MIRROR_AGGREGATION:
+        return []
+
+    cache_file = DATA_DIR / "mirror_sites_cache.json"
+    now = time.time()
+    try:
+        cache = read_json(cache_file, {})
+        cached_at = float(cache.get("cached_at", 0) or 0)
+        cached_urls = cache.get("urls", [])
+        if now - cached_at <= MIRROR_LIST_CACHE_SECONDS and isinstance(cached_urls, list):
+            return [normalize_source_url(item) for item in cached_urls if normalize_source_url(item)]
+    except Exception:
+        pass
+
+    urls: list[str] = []
+    for page_url in source_page_urls():
+        try:
+            text = fetch_api_text(page_url)
+        except Exception as exc:
+            print(f"[源扫描] 获取官方镜像页失败: {page_url} -> {exc}", flush=True)
+            log_to_json("WARNING", "Main", f"官方镜像页获取失败: {page_url} -> {exc}")
+            continue
+        for match in re.findall(r"https?://[A-Za-z0-9._:/?=&%-]+", text):
+            candidate = normalize_source_url(match)
+            if candidate and candidate not in urls:
+                urls.append(candidate)
+        if len(urls) >= SOURCE_SCAN_CANDIDATE_LIMIT:
+            break
+
+    urls = urls[:SOURCE_SCAN_CANDIDATE_LIMIT]
+    try:
+        write_json(cache_file, {"cached_at": now, "urls": urls})
+    except Exception:
+        pass
+    return urls
+
+def collect_source_scan_candidates(pool: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for item in sort_source_entries(list(pool.get("sources", []))):
+        if item.get("type") not in ("system", "manual"):
+            continue
+        url = normalize_source_url(item.get("url"))
+        if url and url not in urls:
+            urls.append(url)
+    for item in load_mirror_site_urls():
+        url = normalize_source_url(item)
+        if url and url not in urls:
+            urls.append(url)
+    return urls[:SOURCE_SCAN_CANDIDATE_LIMIT]
+
+def update_source_entry_with_probe(entry: dict[str, Any], result: dict[str, Any]) -> None:
+    checked_at = float(result.get("checked_at", time.time()) or time.time())
+    entry["last_checked_at"] = checked_at
+    entry["last_http_code"] = max(0, parse_int(result.get("http_code")))
+    if result.get("ok"):
+        entry["healthy"] = True
+        entry["status"] = "可用"
+        entry["last_error"] = ""
+        entry["consecutive_failures"] = 0
+        entry["success_count"] = max(0, parse_int(entry.get("success_count"))) + 1
+        entry["last_success_at"] = checked_at
+    else:
+        entry["healthy"] = False
+        entry["status"] = "不可用"
+        entry["last_error"] = str(result.get("error") or "连接失败")
+        entry["failure_count"] = max(0, parse_int(entry.get("failure_count"))) + 1
+        entry["consecutive_failures"] = max(0, parse_int(entry.get("consecutive_failures"))) + 1
+
+def run_source_scan(force: bool = False) -> dict[str, Any]:
+    if not source_scan_lock.acquire(blocking=False):
+        return {"ok": False, "message": "源扫描正在进行中"}
+    try:
+        heavy_task_lock.acquire()
+        pool = load_source_pool()
+        now = time.time()
+        date_str = time.strftime("%Y-%m-%d", time.localtime(now))
+        if not force and pool.get("last_scan_date") == date_str:
+            return {"ok": False, "message": "今天的源扫描已经执行过"}
+
+        entries_by_url = {
+            normalize_source_url(item.get("url")): dict(item)
+            for item in pool.get("sources", [])
+            if normalize_source_url(item.get("url"))
+        }
+        candidates = collect_source_scan_candidates(pool)
+        scanned = 0
+        healthy = 0
+        removed = 0
+        added = 0
+
+        for source_url in candidates:
+            if source_url not in entries_by_url:
+                entries_by_url[source_url] = default_source_entry(source_url, "mirror")
+                added += 1
+            entry = entries_by_url[source_url]
+            result = probe_api_source(source_url)
+            update_source_entry_with_probe(entry, result)
+            scanned += 1
+            if result.get("ok"):
+                healthy += 1
+
+        kept_sources: list[dict[str, Any]] = []
+        for item in entries_by_url.values():
+            if item.get("type") != "system" and parse_int(item.get("consecutive_failures")) >= SOURCE_DELETE_FAILURE_THRESHOLD:
+                removed += 1
+                continue
+            kept_sources.append(item)
+
+        message = f"源扫描完成：检测 {scanned} 个，健康 {healthy} 个，新增 {added} 个，删除 {removed} 个"
+        pool["last_scan_at"] = now
+        pool["last_scan_date"] = date_str
+        pool["last_scan_message"] = message
+        pool["sources"] = sort_source_entries(kept_sources)
+        saved_pool = save_source_pool(pool)
+        set_state(
+            source_last_scan_at=now,
+            source_last_scan_message=message,
+            source_total_count=len(saved_pool.get("sources", [])),
+            healthy_source_count=len([item for item in saved_pool.get("sources", []) if item.get("healthy")]),
+        )
+        log_to_json("INFO", "Main", message)
+        return {"ok": True, "message": message, "pool": saved_pool}
+    finally:
+        heavy_task_lock.release()
+        source_scan_lock.release()
+
+def schedule_source_scan(force: bool = False) -> bool:
+    if source_scan_lock.locked():
+        return False
+
+    def worker() -> None:
+        try:
+            run_source_scan(force=force)
+        except Exception as exc:
+            print(f"[源扫描] 执行失败: {exc}", flush=True)
+            log_to_json("WARNING", "Main", f"源扫描失败: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+def should_run_daily_source_scan(now: float) -> bool:
+    pool = load_source_pool()
+    date_str = time.strftime("%Y-%m-%d", time.localtime(now))
+    local_time = time.localtime(now)
+    return local_time.tm_hour == 0 and pool.get("last_scan_date") != date_str
+
+def update_source_runtime_result(source_url: str, ok: bool, error: str = "", http_code: int = 0) -> None:
+    normalized_url = normalize_source_url(source_url)
+    if not normalized_url:
+        return
+    pool = load_source_pool()
+    entries = {item.get("url"): dict(item) for item in pool.get("sources", []) if item.get("url")}
+    if normalized_url not in entries:
+        return
+    result = {
+        "ok": ok,
+        "error": error,
+        "http_code": http_code,
+        "checked_at": time.time(),
+    }
+    update_source_entry_with_probe(entries[normalized_url], result)
+    pool["sources"] = [
+        item
+        for item in sort_source_entries(list(entries.values()))
+        if item.get("type") == "system" or parse_int(item.get("consecutive_failures")) < SOURCE_DELETE_FAILURE_THRESHOLD
+    ]
+    save_source_pool(pool)
+
+def get_active_fetch_source_urls() -> list[str]:
+    pool = load_source_pool()
+
+    def pick_urls() -> list[str]:
+        entries = [item for item in pool.get("sources", []) if item.get("enabled")]
+        if pool.get("use_selected_only"):
+            entries = [item for item in entries if item.get("selected")]
+        entries = [item for item in entries if item.get("healthy")]
+        return [str(item.get("url") or "") for item in sort_source_entries(entries)[:FETCH_SOURCE_LIMIT] if str(item.get("url") or "")]
+
+    urls = pick_urls()
+    if urls:
+        return urls
+
+    scan_result = run_source_scan(force=True)
+    if scan_result.get("ok"):
+        pool = scan_result.get("pool", pool)
+        urls = pick_urls()
+        if urls:
+            return urls
+
+    if pool.get("use_selected_only"):
+        return []
+    fallback = normalize_source_url(API_URL)
+    return [fallback] if fallback else []
+
+def source_pool_public_data() -> dict[str, Any]:
+    pool = load_source_pool()
+    return {
+        "use_selected_only": bool(pool.get("use_selected_only", False)),
+        "last_scan_at": float(pool.get("last_scan_at", 0) or 0),
+        "last_scan_message": str(pool.get("last_scan_message", "") or ""),
+        "scan_running": source_scan_lock.locked(),
+        "sources": sort_source_entries(list(pool.get("sources", []))),
+    }
+
+def add_manual_source(url: str) -> dict[str, Any]:
+    normalized_url = normalize_source_url(url)
+    if not normalized_url:
+        raise ValueError("源地址格式不正确，必须是 http/https")
+    pool = load_source_pool()
+    sources = [dict(item) for item in pool.get("sources", [])]
+    for item in sources:
+        if normalize_source_url(item.get("url")) == normalized_url:
+            item["type"] = "manual"
+            item["enabled"] = True
+            item["selected"] = True
+            pool["sources"] = sources
+            return save_source_pool(pool)
+    sources.append(default_source_entry(normalized_url, "manual"))
+    pool["sources"] = sources
+    return save_source_pool(pool)
+
+def delete_manual_source(url: str) -> dict[str, Any]:
+    normalized_url = normalize_source_url(url)
+    pool = load_source_pool()
+    kept: list[dict[str, Any]] = []
+    removed = False
+    for item in pool.get("sources", []):
+        if normalize_source_url(item.get("url")) == normalized_url and item.get("type") == "manual":
+            removed = True
+            continue
+        kept.append(dict(item))
+    if not removed:
+        raise ValueError("只允许删除手动源")
+    pool["sources"] = kept
+    return save_source_pool(pool)
+
+def update_source_flags(url: str, *, enabled: bool | None = None, selected: bool | None = None) -> dict[str, Any]:
+    normalized_url = normalize_source_url(url)
+    if not normalized_url:
+        raise ValueError("源地址不能为空")
+    pool = load_source_pool()
+    changed = False
+    updated_sources: list[dict[str, Any]] = []
+    for item in pool.get("sources", []):
+        current = dict(item)
+        if normalize_source_url(current.get("url")) == normalized_url:
+            if enabled is not None:
+                current["enabled"] = bool(enabled)
+            if selected is not None:
+                current["selected"] = bool(selected)
+            changed = True
+        updated_sources.append(current)
+    if not changed:
+        raise ValueError("未找到对应的源")
+    pool["sources"] = updated_sources
+    return save_source_pool(pool)
+
+def update_source_preferences(use_selected_only: bool) -> dict[str, Any]:
+    pool = load_source_pool()
+    pool["use_selected_only"] = bool(use_selected_only)
+    return save_source_pool(pool)
 
 def safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
@@ -462,7 +919,7 @@ def merge_node_runtime_fields(base_node: dict[str, Any], old_node: dict[str, Any
             merged[key] = old_node.get(key)
     return merged
 
-def fetch_text_from_many(urls: list[str]) -> list[tuple[str, str]]:
+def legacy_fetch_text_from_many(urls: list[str]) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
     for url in urls:
         try:
@@ -474,7 +931,7 @@ def fetch_text_from_many(urls: list[str]) -> list[tuple[str, str]]:
             log_to_json("WARNING", "Main", f"节点来源失败: {url} -> {exc}")
     return results
 
-def load_mirror_site_urls() -> list[str]:
+def legacy_load_mirror_site_urls() -> list[str]:
     if not ENABLE_MIRROR_AGGREGATION:
         return []
 
@@ -508,7 +965,7 @@ def load_mirror_site_urls() -> list[str]:
         pass
     return urls
 
-def collect_candidate_source_urls() -> list[str]:
+def legacy_collect_candidate_source_urls() -> list[str]:
     urls: list[str] = []
     for item in [API_URL, *EXTRA_VPNGATE_API_URLS]:
         if item and item not in urls:
@@ -760,7 +1217,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
     seen_endpoints: set[tuple[str, int, str]] = set()
     source_summaries: list[str] = []
     has_cache = len(cached_nodes()) > 0
-    source_urls = collect_candidate_source_urls()
+    source_urls = get_active_fetch_source_urls()
     if not source_urls:
         source_urls = [API_URL]
 
@@ -792,7 +1249,9 @@ def fetch_candidates() -> list[dict[str, Any]]:
     for index, source_url in enumerate(source_urls, start=1):
         try:
             rows, actual_url = fetch_rows_from_source(source_url, 1 if has_cache or index > 1 else 2)
+            update_source_runtime_result(actual_url, True, "", 200)
         except Exception as exc:
+            update_source_runtime_result(source_url, False, str(exc), parse_http_code_from_error(exc))
             source_summaries.append(f"来源{index}失败")
             continue
 
@@ -1343,6 +1802,7 @@ def schedule_followup_tests(limit: int | None = None) -> None:
 
     def worker() -> None:
         try:
+            heavy_task_lock.acquire()
             with lock:
                 nodes = read_json(NODES_FILE, [])
                 node_ids = [
@@ -1362,6 +1822,7 @@ def schedule_followup_tests(limit: int | None = None) -> None:
             print(f"[后台续测] 检测待检测节点失败: {exc}", flush=True)
             log_to_json("WARNING", "Main", f"后台续测失败: {exc}")
         finally:
+            heavy_task_lock.release()
             followup_test_lock.release()
 
     threading.Thread(target=worker, daemon=True).start()
@@ -1541,6 +2002,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
         is_connecting = True
 
     try:
+        heavy_task_lock.acquire()
         if force:
             stop_active_openvpn()
 
@@ -1640,6 +2102,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
         schedule_followup_tests(FOLLOWUP_TEST_BATCH_SIZE)
         return message
     finally:
+        heavy_task_lock.release()
         with lock:
             is_connecting = False
         maintain_job_lock.release()
@@ -1654,6 +2117,7 @@ def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> st
         is_connecting = True
 
     try:
+        heavy_task_lock.acquire()
         if force and disconnect_active:
             stop_active_openvpn()
 
@@ -1775,6 +2239,7 @@ def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> st
         schedule_followup_tests(FOLLOWUP_TEST_BATCH_SIZE)
         return message
     finally:
+        heavy_task_lock.release()
         with lock:
             is_connecting = False
         maintain_job_lock.release()
@@ -1789,6 +2254,9 @@ def collector_loop() -> None:
             total_valid_nodes = len([node for node in current_nodes if node.get("probe_status") == "available"])
             routed_valid_nodes = count_available_nodes_for_routing(current_nodes, ui_cfg)
             current_state = get_state()
+            if should_run_daily_source_scan(time.time()):
+                run_source_scan(force=False)
+                continue
             should_refresh, refresh_reason = should_trigger_auto_refresh(current_state, routed_valid_nodes, time.time())
             set_state(
                 valid_nodes=total_valid_nodes,
@@ -3193,6 +3661,10 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
           代理及网络设置
         </a>
+        <a href="javascript:void(0)" onclick="openSourceModal()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h16" /></svg>
+          API源管理
+        </a>
         <a href="javascript:void(0)" onclick="openGatewayModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
           网关
@@ -3466,6 +3938,67 @@ INDEX_HTML = r"""<!doctype html>
 
   <div class="vps-promo-tab" onclick="openAdModal()">VPS购买推荐</div>
 
+  <!-- Source Modal (API 源管理) -->
+  <div id="source_modal" class="modal">
+    <div class="modal-content" style="max-width: 920px; width: 96%;">
+      <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h16" /></svg>
+          API 源管理
+        </h3>
+        <button type="button" onclick="closeSourceModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+
+      <div id="source_error" style="display: none; color: var(--danger); font-size: 13px; margin-bottom: 14px; padding: 8px 12px; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.2); border-radius: 8px;"></div>
+      <div id="source_success" style="display: none; color: var(--success); font-size: 13px; margin-bottom: 14px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 8px;"></div>
+
+      <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px;">
+        <label style="display: inline-flex; align-items: center; gap: 8px; color: var(--text-primary); font-size: 13px; cursor: pointer;">
+          <input type="checkbox" id="source_use_selected_only" style="accent-color: #22c55e;">
+          <span>只使用我勾选的源</span>
+        </label>
+        <input id="source_add_input" class="input-field" placeholder="输入手动源地址，支持域名或完整 api/iphone/ 地址" style="flex: 1 1 320px; min-width: 260px;">
+        <button id="source_add_btn" type="button" class="btn-primary" style="height: 40px; padding: 0 18px;">添加手动源</button>
+        <button id="source_scan_btn" type="button" class="btn-primary" style="height: 40px; padding: 0 18px; background: var(--success-gradient);">立即扫描</button>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; font-size: 13px; color: var(--text-secondary);">
+        <div>源总数: <strong id="source_total_count_text" style="color: var(--text-primary);">0</strong></div>
+        <div>健康源: <strong id="source_healthy_count_text" style="color: var(--text-primary);">0</strong></div>
+        <div>最近扫描: <strong id="source_last_scan_time_text" style="color: var(--text-primary);">从未</strong></div>
+      </div>
+
+      <div id="source_last_scan_message" style="margin-bottom: 14px; padding: 10px 12px; border-radius: 8px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); color: var(--text-secondary); font-size: 13px;">
+        暂无扫描记录
+      </div>
+
+      <div class="table-wrapper" style="margin-bottom: 0;">
+        <div class="table-container" style="max-height: 420px; overflow: auto;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 96px;">状态</th>
+                <th style="width: 96px;">类型</th>
+                <th>地址</th>
+                <th style="width: 88px;">勾选</th>
+                <th style="width: 88px;">启用</th>
+                <th style="width: 100px;">连续失败</th>
+                <th style="width: 120px;">操作</th>
+              </tr>
+            </thead>
+            <tbody id="source_rows">
+              <tr>
+                <td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 20px 0;">正在加载源列表...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Gateway Modal (网关自检与代理测试) -->
   <div id="gateway_modal" class="modal">
     <div class="modal-content" style="max-width: 600px; width: 90%;">
@@ -3578,6 +4111,8 @@ let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
 const pageSize = 15;
 let currentPageNodes = [];
+let sourcePool = null;
+let sourcePollInterval = null;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -4413,6 +4948,15 @@ $("refresh").onclick=async()=>{
     $("refresh").textContent="更新节点";
   }, 3000);
 };
+$("source_use_selected_only").onchange = saveSourcePreferences;
+$("source_add_btn").onclick = addSource;
+$("source_scan_btn").onclick = triggerSourceScan;
+$("source_add_input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    addSource();
+  }
+});
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
   const badge = $("proxy_status_badge");
@@ -4618,6 +5162,267 @@ function openNetworkModal() {
 
 function closeNetworkModal() {
   $("network_modal").style.display = "none";
+}
+
+function setSourceBanner(kind, message) {
+  const errorBox = $("source_error");
+  const successBox = $("source_success");
+  if (!errorBox || !successBox) return;
+  errorBox.style.display = "none";
+  successBox.style.display = "none";
+  if (!message) return;
+  const target = kind === "error" ? errorBox : successBox;
+  target.textContent = message;
+  target.style.display = "block";
+}
+
+function sourceTypeText(type) {
+  const dict = { system: "系统", manual: "手动", mirror: "镜像" };
+  return dict[type] || "未知";
+}
+
+function sourceStatusBadge(item) {
+  if (item?.healthy) return { className: "available", text: "可用" };
+  if ((item?.status || "") === "待扫描") return { className: "not_checked", text: "待扫描" };
+  return { className: "unavailable", text: "不可用" };
+}
+
+function setSourceActionBusy(busy) {
+  const scanBtn = $("source_scan_btn");
+  const addBtn = $("source_add_btn");
+  const selectedOnly = $("source_use_selected_only");
+  const addInput = $("source_add_input");
+  if (scanBtn) scanBtn.disabled = !!busy;
+  if (addBtn) addBtn.disabled = !!busy;
+  if (selectedOnly) selectedOnly.disabled = !!busy;
+  if (addInput) addInput.disabled = !!busy;
+}
+
+function renderSources() {
+  const rows = $("source_rows");
+  if (!rows) return;
+  const sources = sourcePool?.sources || [];
+  const useSelectedOnly = Boolean(sourcePool?.use_selected_only);
+  const scanRunning = Boolean(sourcePool?.scan_running);
+  const healthyCount = sources.filter(item => item && item.healthy).length;
+
+  $("source_total_count_text").textContent = String(sources.length);
+  $("source_healthy_count_text").textContent = String(healthyCount);
+  $("source_last_scan_time_text").textContent = time(sourcePool?.last_scan_at || 0);
+  $("source_last_scan_message").textContent = sourcePool?.last_scan_message || "暂无扫描记录";
+  $("source_use_selected_only").checked = useSelectedOnly;
+
+  const scanBtn = $("source_scan_btn");
+  if (scanBtn) {
+    scanBtn.disabled = scanRunning;
+    scanBtn.textContent = scanRunning ? "扫描中..." : "立即扫描";
+  }
+
+  if (!sources.length) {
+    rows.innerHTML = `<tr><td colspan="7" style="text-align:center; color: var(--text-secondary); padding: 20px 0;">当前还没有可管理的源</td></tr>`;
+    return;
+  }
+
+  rows.innerHTML = sources.map(item => {
+    const badge = sourceStatusBadge(item);
+    const url = String(item?.url || "");
+    const urlToken = encodeURIComponent(url);
+    const details = [];
+    if (item?.last_http_code) details.push(`HTTP ${item.last_http_code}`);
+    if (item?.last_error) details.push(item.last_error);
+    const detailText = details.length ? `<div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">${esc(details.join(" | "))}</div>` : "";
+    const lastCheckText = item?.last_checked_at ? `<div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">上次检测: ${esc(time(item.last_checked_at))}</div>` : "";
+    const deleteBtn = item?.type === "manual"
+      ? `<button type="button" class="connect-btn" style="border-color: rgba(244,63,94,0.35); color: #fecdd3;" onclick="deleteSource('${urlToken}')">删除</button>`
+      : `<span style="font-size: 12px; color: var(--text-secondary);">-</span>`;
+
+    return `
+      <tr>
+        <td><span class="badge ${badge.className}">${badge.text}</span></td>
+        <td>${esc(sourceTypeText(item?.type))}</td>
+        <td class="mono" style="font-size: 12px; line-height: 1.6; word-break: break-all;">
+          ${esc(url)}
+          ${detailText}
+          ${lastCheckText}
+        </td>
+        <td>
+          <label style="display:flex; justify-content:center; cursor:pointer;">
+            <input type="checkbox" ${item?.selected ? "checked" : ""} onchange="toggleSourceSelected('${urlToken}', this.checked)" style="accent-color: #22c55e;">
+          </label>
+        </td>
+        <td>
+          <label style="display:flex; justify-content:center; cursor:pointer;">
+            <input type="checkbox" ${item?.enabled ? "checked" : ""} onchange="toggleSourceEnabled('${urlToken}', this.checked)" style="accent-color: #22c55e;">
+          </label>
+        </td>
+        <td style="text-align:center;">${Number(item?.consecutive_failures || 0)}</td>
+        <td style="text-align:center;">${deleteBtn}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+async function loadSources(options = {}) {
+  const { silent = false } = options;
+  try {
+    const res = await fetch("./api/sources");
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || "加载源列表失败");
+    }
+    sourcePool = data;
+    renderSources();
+    if (!silent && data.scan_running) {
+      setSourceBanner("success", "源扫描正在后台执行，页面会自动刷新结果");
+    }
+  } catch (err) {
+    if (!silent) {
+      setSourceBanner("error", err?.message || "加载源列表失败");
+    }
+  }
+}
+
+function openSourceModal() {
+  $("admin_dropdown").style.display = "none";
+  $("source_modal").style.display = "flex";
+  setSourceBanner("", "");
+  loadSources();
+  if (sourcePollInterval) clearInterval(sourcePollInterval);
+  sourcePollInterval = setInterval(() => {
+    if ($("source_modal").style.display === "flex") {
+      loadSources({ silent: true });
+    }
+  }, 4000);
+}
+
+function closeSourceModal() {
+  $("source_modal").style.display = "none";
+  if (sourcePollInterval) {
+    clearInterval(sourcePollInterval);
+    sourcePollInterval = null;
+  }
+}
+
+async function saveSourcePreferences() {
+  const checkbox = $("source_use_selected_only");
+  try {
+    const res = await fetch("./api/source_preferences", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ use_selected_only: !!checkbox.checked })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || "保存失败");
+    }
+    setSourceBanner("success", "源使用偏好已保存");
+    await loadSources({ silent: true });
+  } catch (err) {
+    checkbox.checked = !checkbox.checked;
+    setSourceBanner("error", err?.message || "保存失败");
+  }
+}
+
+async function addSource() {
+  const input = $("source_add_input");
+  const url = input.value.trim();
+  if (!url) {
+    setSourceBanner("error", "请输入手动源地址");
+    return;
+  }
+  setSourceActionBusy(true);
+  try {
+    const res = await fetch("./api/source_add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || "添加手动源失败");
+    }
+    input.value = "";
+    setSourceBanner("success", data.message || "手动源已保存");
+    await loadSources({ silent: true });
+  } catch (err) {
+    setSourceBanner("error", err?.message || "添加手动源失败");
+  } finally {
+    setSourceActionBusy(false);
+  }
+}
+
+async function triggerSourceScan() {
+  setSourceActionBusy(true);
+  try {
+    const res = await fetch("./api/source_scan", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || "启动源扫描失败");
+    }
+    setSourceBanner("success", data.message || "已在后台启动源扫描");
+    await loadSources({ silent: true });
+  } catch (err) {
+    setSourceBanner("error", err?.message || "启动源扫描失败");
+  } finally {
+    if (sourcePool?.scan_running) {
+      renderSources();
+    } else {
+      setSourceActionBusy(false);
+    }
+  }
+}
+
+async function updateSourceFlag(url, payload) {
+  try {
+    const res = await fetch("./api/source_update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, ...payload })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || "更新源设置失败");
+    }
+    setSourceBanner("success", data.message || "源设置已更新");
+    await loadSources({ silent: true });
+  } catch (err) {
+    setSourceBanner("error", err?.message || "更新源设置失败");
+    await loadSources({ silent: true });
+  }
+}
+
+async function toggleSourceEnabled(urlToken, enabled) {
+  const url = decodeURIComponent(urlToken);
+  await updateSourceFlag(url, { enabled: !!enabled });
+}
+
+async function toggleSourceSelected(urlToken, selected) {
+  const url = decodeURIComponent(urlToken);
+  await updateSourceFlag(url, { selected: !!selected });
+}
+
+async function deleteSource(urlToken) {
+  const url = decodeURIComponent(urlToken);
+  if (!confirm("确定要删除这个手动源吗？")) {
+    await loadSources({ silent: true });
+    return;
+  }
+  try {
+    const res = await fetch("./api/source_delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || "删除手动源失败");
+    }
+    setSourceBanner("success", data.message || "手动源已删除");
+    await loadSources({ silent: true });
+  } catch (err) {
+    setSourceBanner("error", err?.message || "删除手动源失败");
+    await loadSources({ silent: true });
+  }
 }
 
 async function saveNetwork(e) {
@@ -5386,6 +6191,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"[API Logs] Error reading log file: {e}", flush=True)
             self.send_json({"logs": entries})
+        elif effective_path == "/api/sources":
+            self.send_json({"ok": True, **source_pool_public_data()})
         else:
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -5448,6 +6255,66 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authorized():
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        if effective_path == "/api/source_scan":
+            started = schedule_source_scan(force=True)
+            if started:
+                self.send_json({"ok": True, "message": "已在后台启动源扫描"})
+            else:
+                self.send_json({"ok": False, "error": "源扫描正在进行中"}, HTTPStatus.CONFLICT)
+            return
+
+        if effective_path == "/api/source_add":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                save_pool = add_manual_source(str(payload.get("url") or ""))
+                self.send_json({"ok": True, "message": "手动源已保存", "sources": save_pool.get("sources", [])})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/source_delete":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                save_pool = delete_manual_source(str(payload.get("url") or ""))
+                self.send_json({"ok": True, "message": "手动源已删除", "sources": save_pool.get("sources", [])})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/source_update":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                enabled = payload["enabled"] if "enabled" in payload else None
+                selected = payload["selected"] if "selected" in payload else None
+                save_pool = update_source_flags(
+                    str(payload.get("url") or ""),
+                    enabled=enabled,
+                    selected=selected,
+                )
+                self.send_json({"ok": True, "message": "源设置已更新", "sources": save_pool.get("sources", [])})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/source_preferences":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                save_pool = update_source_preferences(bool(payload.get("use_selected_only")))
+                self.send_json({"ok": True, "message": "源偏好已更新", "use_selected_only": save_pool.get("use_selected_only", False)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if effective_path == "/api/update_credentials":
