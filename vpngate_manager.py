@@ -814,6 +814,35 @@ def source_pool_public_data() -> dict[str, Any]:
         "sources": sort_source_entries(list(pool.get("sources", []))),
     }
 
+def probe_single_source(url: str) -> dict[str, Any]:
+    normalized_url = normalize_source_url(url)
+    if not normalized_url:
+        raise ValueError("源地址不能为空")
+    if not source_scan_lock.acquire(blocking=False):
+        raise RuntimeError("源扫描正在进行中，请稍后再试")
+    try:
+        pool = load_source_pool()
+        sources = [dict(item) for item in pool.get("sources", [])]
+        target_entry: dict[str, Any] | None = None
+        for item in sources:
+            if normalize_source_url(item.get("url")) == normalized_url:
+                target_entry = item
+                break
+        if target_entry is None:
+            raise ValueError("未找到对应的源")
+
+        result = probe_api_source(normalized_url)
+        update_source_entry_with_probe(target_entry, result)
+        pool["sources"] = sort_source_entries(sources)
+        saved_pool = save_source_pool(pool)
+        saved_entry = next(
+            (dict(item) for item in saved_pool.get("sources", []) if normalize_source_url(item.get("url")) == normalized_url),
+            dict(target_entry),
+        )
+        return {"pool": saved_pool, "entry": saved_entry, "result": result}
+    finally:
+        source_scan_lock.release()
+
 def add_manual_source(url: str) -> dict[str, Any]:
     normalized_url = normalize_source_url(url)
     if not normalized_url:
@@ -3587,6 +3616,155 @@ INDEX_HTML = r"""<!doctype html>
       box-sizing: border-box;
       animation: modalFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
+    .source-modal-content {
+      width: min(75vw, 1200px);
+      max-width: min(75vw, 1200px);
+      min-width: min(960px, calc(100vw - 32px));
+      padding: 28px 30px 30px;
+    }
+    .source-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .source-toolbar .input-field {
+      flex: 1 1 420px;
+      min-width: 280px;
+    }
+    .source-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 18px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+    .source-table-shell {
+      margin-bottom: 0;
+    }
+    .source-table-container {
+      max-height: 58vh;
+      overflow: auto;
+    }
+    .source-table {
+      width: 100%;
+      min-width: 0;
+      table-layout: fixed;
+    }
+    .source-table th,
+    .source-table td {
+      padding: 14px 14px;
+      vertical-align: middle;
+    }
+    .source-table th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    .source-table th.source-col-status,
+    .source-table td.source-col-status {
+      width: 90px;
+    }
+    .source-table th.source-col-type,
+    .source-table td.source-col-type {
+      width: 78px;
+    }
+    .source-table th.source-col-address,
+    .source-table td.source-col-address {
+      width: auto;
+    }
+    .source-table th.source-col-enabled,
+    .source-table td.source-col-enabled {
+      width: 84px;
+      text-align: center;
+    }
+    .source-table th.source-col-failed,
+    .source-table td.source-col-failed {
+      width: 76px;
+      text-align: center;
+    }
+    .source-table th.source-col-actions,
+    .source-table td.source-col-actions {
+      width: 196px;
+      text-align: center;
+    }
+    .source-url-cell {
+      min-width: 0;
+      padding-right: 8px;
+    }
+    .source-url-main {
+      font-size: 12px;
+      line-height: 1.55;
+      word-break: break-all;
+      color: var(--text-primary);
+    }
+    .source-url-meta {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .source-checkbox-wrap {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      cursor: pointer;
+    }
+    .source-checkbox-wrap input {
+      accent-color: #22c55e;
+    }
+    .source-failure-count {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 24px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .source-actions {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .source-test-btn {
+      min-width: 72px;
+      height: 34px;
+      padding: 0 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      background: rgba(99, 102, 241, 0.14);
+      color: #c7d2fe;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .source-test-btn:hover:not(:disabled) {
+      background: rgba(99, 102, 241, 0.24);
+      border-color: rgba(129, 140, 248, 0.5);
+      color: #e0e7ff;
+    }
+    .source-test-btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    @media (max-width: 1100px) {
+      .source-modal-content {
+        width: calc(100vw - 24px);
+        max-width: calc(100vw - 24px);
+        min-width: 0;
+        padding: 24px 18px;
+      }
+      .source-table {
+        min-width: 940px;
+      }
+    }
     @keyframes modalFadeIn {
       from { transform: scale(0.95); opacity: 0; }
       to { transform: scale(1); opacity: 1; }
@@ -3978,7 +4156,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Source Modal (API 源管理) -->
   <div id="source_modal" class="modal">
-    <div class="modal-content" style="max-width: 860px; width: 96%;">
+    <div class="modal-content source-modal-content">
       <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h16" /></svg>
@@ -3992,13 +4170,13 @@ INDEX_HTML = r"""<!doctype html>
       <div id="source_error" style="display: none; color: var(--danger); font-size: 13px; margin-bottom: 14px; padding: 8px 12px; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.2); border-radius: 8px;"></div>
       <div id="source_success" style="display: none; color: var(--success); font-size: 13px; margin-bottom: 14px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 8px;"></div>
 
-      <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px;">
-        <input id="source_add_input" class="input-field" placeholder="输入手动源地址，支持域名或完整 api/iphone/ 地址" style="flex: 1 1 320px; min-width: 260px;">
+      <div class="source-toolbar">
+        <input id="source_add_input" class="input-field" placeholder="输入手动源地址，支持域名或完整 api/iphone/ 地址">
         <button id="source_add_btn" type="button" class="btn-primary" style="height: 40px; padding: 0 18px;">添加手动源</button>
         <button id="source_scan_btn" type="button" class="btn-primary" style="height: 40px; padding: 0 18px; background: var(--success-gradient);">立即扫描</button>
       </div>
 
-      <div style="display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; font-size: 13px; color: var(--text-secondary);">
+      <div class="source-summary">
         <div>源总数: <strong id="source_total_count_text" style="color: var(--text-primary);">0</strong></div>
         <div>健康源: <strong id="source_healthy_count_text" style="color: var(--text-primary);">0</strong></div>
         <div>最近扫描: <strong id="source_last_scan_time_text" style="color: var(--text-primary);">从未</strong></div>
@@ -4008,17 +4186,17 @@ INDEX_HTML = r"""<!doctype html>
         暂无扫描记录
       </div>
 
-      <div class="table-wrapper" style="margin-bottom: 0;">
-        <div class="table-container" style="max-height: 420px; overflow: auto;">
-          <table style="width: 100%; table-layout: fixed;">
+      <div class="table-wrapper source-table-shell">
+        <div class="table-container source-table-container">
+          <table class="source-table">
             <thead>
               <tr>
-                <th style="width: 84px;">状态</th>
-                <th style="width: 76px;">类型</th>
-                <th>地址</th>
-                <th style="width: 68px;">启用</th>
-                <th style="width: 72px;">失败</th>
-                <th style="width: 84px;">操作</th>
+                <th class="source-col-status">状态</th>
+                <th class="source-col-type">类型</th>
+                <th class="source-col-address">地址</th>
+                <th class="source-col-enabled">启用</th>
+                <th class="source-col-failed">失败</th>
+                <th class="source-col-actions">操作</th>
               </tr>
             </thead>
             <tbody id="source_rows">
@@ -4146,6 +4324,7 @@ const pageSize = 15;
 let currentPageNodes = [];
 let sourcePool = null;
 let sourcePollInterval = null;
+let sourceProbePending = new Set();
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -5267,28 +5446,36 @@ function renderSources() {
     const badge = sourceStatusBadge(item);
     const url = String(item?.url || "");
     const urlToken = encodeURIComponent(url);
+    const isProbePending = sourceProbePending.has(url);
     const details = [];
     if (item?.last_http_code) details.push(`HTTP ${item.last_http_code}`);
     if (item?.last_error) details.push(item.last_error);
     if (item?.last_checked_at) details.push(`检测 ${time(item.last_checked_at)}`);
-    const detailText = details.length ? `<div style="font-size: 12px; color: var(--text-secondary); margin-top: 3px; line-height: 1.5;">${esc(details.join(" · "))}</div>` : "";
+    const detailText = details.length ? `<div class="source-url-meta">${esc(details.join(" · "))}</div>` : "";
+    const scanBtnText = isProbePending ? `<span class="badge-pulse"></span>检测中` : "检测";
+    const scanBtn = `<button type="button" class="source-test-btn" ${scanRunning || isProbePending ? "disabled" : ""} onclick="probeSource('${urlToken}')">${scanBtnText}</button>`;
     const deleteBtn = `<button type="button" class="connect-btn" style="border-color: rgba(244,63,94,0.35); color: #fecdd3;" onclick="deleteSource('${urlToken}')">删除</button>`;
 
     return `
       <tr>
-        <td><span class="badge ${badge.className}">${badge.text}</span></td>
-        <td>${esc(sourceTypeText(item?.type))}</td>
-        <td class="mono" style="font-size: 12px; line-height: 1.5; word-break: break-all; padding-right: 8px;">
-          ${esc(url)}
+        <td class="source-col-status"><span class="badge ${badge.className}">${badge.text}</span></td>
+        <td class="source-col-type">${esc(sourceTypeText(item?.type))}</td>
+        <td class="source-col-address source-url-cell">
+          <div class="mono source-url-main">${esc(url)}</div>
           ${detailText}
         </td>
-        <td>
-          <label style="display:flex; justify-content:center; cursor:pointer;">
-            <input type="checkbox" ${item?.enabled ? "checked" : ""} onchange="toggleSourceEnabled('${urlToken}', this.checked)" style="accent-color: #22c55e;">
+        <td class="source-col-enabled">
+          <label class="source-checkbox-wrap">
+            <input type="checkbox" ${item?.enabled ? "checked" : ""} onchange="toggleSourceEnabled('${urlToken}', this.checked)" ${scanRunning ? "disabled" : ""}>
           </label>
         </td>
-        <td style="text-align:center;">${Number(item?.consecutive_failures || 0)}</td>
-        <td style="text-align:center;">${deleteBtn}</td>
+        <td class="source-col-failed"><span class="source-failure-count">${Number(item?.consecutive_failures || 0)}</span></td>
+        <td class="source-col-actions">
+          <div class="source-actions">
+            ${scanBtn}
+            ${deleteBtn}
+          </div>
+        </td>
       </tr>
     `;
   }).join("");
@@ -5406,6 +5593,32 @@ async function updateSourceFlag(url, payload) {
 async function toggleSourceEnabled(urlToken, enabled) {
   const url = decodeURIComponent(urlToken);
   await updateSourceFlag(url, { enabled: !!enabled, selected: !!enabled });
+}
+
+async function probeSource(urlToken) {
+  const url = decodeURIComponent(urlToken);
+  if (!url) return;
+  sourceProbePending.add(url);
+  renderSources();
+  try {
+    const res = await fetch("./api/source_probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    const data = await readSourceJsonResponse(res, "检测源失败：服务器返回异常");
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || "检测源失败");
+    }
+    setSourceBanner("success", data.message || "源检测已完成");
+    await loadSources({ silent: true });
+  } catch (err) {
+    setSourceBanner("error", err?.message || "检测源失败");
+    await loadSources({ silent: true });
+  } finally {
+    sourceProbePending.delete(url);
+    renderSources();
+  }
 }
 
 async function deleteSource(urlToken) {
@@ -6288,6 +6501,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "message": "手动源已保存", "sources": save_pool.get("sources", [])})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/source_probe":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                probe_data = probe_single_source(str(payload.get("url") or ""))
+                entry = probe_data.get("entry", {})
+                status_text = "可用" if entry.get("healthy") else "不可用"
+                self.send_json({"ok": True, "message": f"单个源检测完成：{status_text}", "entry": entry})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except RuntimeError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
