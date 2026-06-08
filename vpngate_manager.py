@@ -472,11 +472,21 @@ def sort_source_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         key=lambda item: (
             0 if item.get("healthy") else 1,
             source_type_order(item.get("type")),
-            0 if item.get("selected") else 1,
+            0 if item.get("enabled") else 1,
             -float(item.get("last_success_at", 0) or 0),
             str(item.get("url") or ""),
         ),
     )
+
+def normalize_deleted_source_urls(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    urls: list[str] = []
+    for item in values:
+        url = normalize_source_url(item)
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 def load_source_pool() -> dict[str, Any]:
     try:
@@ -484,6 +494,8 @@ def load_source_pool() -> dict[str, Any]:
     except Exception:
         raw = {}
 
+    deleted_urls = normalize_deleted_source_urls(raw.get("deleted_urls", []))
+    deleted_url_set = set(deleted_urls)
     entries_by_url: dict[str, dict[str, Any]] = {}
     raw_sources = raw.get("sources", [])
     if not isinstance(raw_sources, list):
@@ -495,12 +507,14 @@ def load_source_pool() -> dict[str, Any]:
         url = normalize_source_url(item.get("url"))
         if not url:
             continue
+        if url in deleted_url_set:
+            continue
         source_type = str(item.get("type") or "mirror").strip().lower()
         if source_type not in ("system", "manual", "mirror"):
             source_type = "mirror"
         entry = default_source_entry(url, source_type)
         entry["enabled"] = bool(item.get("enabled", True))
-        entry["selected"] = bool(item.get("selected", entry["selected"]))
+        entry["selected"] = entry["enabled"]
         entry["healthy"] = bool(item.get("healthy", False))
         entry["status"] = str(item.get("status") or "待扫描")
         entry["consecutive_failures"] = max(0, parse_int(item.get("consecutive_failures")))
@@ -513,11 +527,12 @@ def load_source_pool() -> dict[str, Any]:
         entries_by_url[url] = entry
 
     system_url = normalize_source_url(API_URL)
-    if system_url and system_url not in entries_by_url:
+    if system_url and system_url not in entries_by_url and system_url not in deleted_url_set:
         entries_by_url[system_url] = default_source_entry(system_url, "system")
 
     return {
         "use_selected_only": bool(raw.get("use_selected_only", False)),
+        "deleted_urls": deleted_urls,
         "last_scan_at": float(raw.get("last_scan_at", 0) or 0),
         "last_scan_date": str(raw.get("last_scan_date") or ""),
         "last_scan_message": str(raw.get("last_scan_message") or ""),
@@ -525,12 +540,19 @@ def load_source_pool() -> dict[str, Any]:
     }
 
 def save_source_pool(pool: dict[str, Any]) -> dict[str, Any]:
+    deleted_urls = normalize_deleted_source_urls(pool.get("deleted_urls", []))
+    deleted_url_set = set(deleted_urls)
     normalized = {
         "use_selected_only": bool(pool.get("use_selected_only", False)),
+        "deleted_urls": deleted_urls,
         "last_scan_at": float(pool.get("last_scan_at", 0) or 0),
         "last_scan_date": str(pool.get("last_scan_date") or ""),
         "last_scan_message": str(pool.get("last_scan_message") or ""),
-        "sources": sort_source_entries(list(pool.get("sources", []))),
+        "sources": sort_source_entries([
+            item
+            for item in list(pool.get("sources", []))
+            if normalize_source_url(item.get("url")) not in deleted_url_set
+        ]),
     }
     write_json(SOURCES_FILE, normalized)
     return normalized
@@ -622,16 +644,17 @@ def load_mirror_site_urls() -> list[str]:
     return urls
 
 def collect_source_scan_candidates(pool: dict[str, Any]) -> list[str]:
+    deleted_url_set = set(normalize_deleted_source_urls(pool.get("deleted_urls", [])))
     urls: list[str] = []
     for item in sort_source_entries(list(pool.get("sources", []))):
         if item.get("type") not in ("system", "manual"):
             continue
         url = normalize_source_url(item.get("url"))
-        if url and url not in urls:
+        if url and url not in deleted_url_set and url not in urls:
             urls.append(url)
     for item in load_mirror_site_urls():
         url = normalize_source_url(item)
-        if url and url not in urls:
+        if url and url not in deleted_url_set and url not in urls:
             urls.append(url)
     return urls[:SOURCE_SCAN_CANDIDATE_LIMIT]
 
@@ -669,6 +692,7 @@ def run_source_scan(force: bool = False) -> dict[str, Any]:
             for item in pool.get("sources", [])
             if normalize_source_url(item.get("url"))
         }
+        deleted_url_set = set(normalize_deleted_source_urls(pool.get("deleted_urls", [])))
         candidates = collect_source_scan_candidates(pool)
         scanned = 0
         healthy = 0
@@ -676,6 +700,8 @@ def run_source_scan(force: bool = False) -> dict[str, Any]:
         added = 0
 
         for source_url in candidates:
+            if source_url in deleted_url_set:
+                continue
             if source_url not in entries_by_url:
                 entries_by_url[source_url] = default_source_entry(source_url, "mirror")
                 added += 1
@@ -755,11 +781,10 @@ def update_source_runtime_result(source_url: str, ok: bool, error: str = "", htt
 
 def get_active_fetch_source_urls() -> list[str]:
     pool = load_source_pool()
+    deleted_url_set = set(normalize_deleted_source_urls(pool.get("deleted_urls", [])))
 
     def pick_urls() -> list[str]:
         entries = [item for item in pool.get("sources", []) if item.get("enabled")]
-        if pool.get("use_selected_only"):
-            entries = [item for item in entries if item.get("selected")]
         entries = [item for item in entries if item.get("healthy")]
         return [str(item.get("url") or "") for item in sort_source_entries(entries)[:FETCH_SOURCE_LIMIT] if str(item.get("url") or "")]
 
@@ -774,9 +799,9 @@ def get_active_fetch_source_urls() -> list[str]:
         if urls:
             return urls
 
-    if pool.get("use_selected_only"):
-        return []
     fallback = normalize_source_url(API_URL)
+    if fallback in deleted_url_set:
+        return []
     return [fallback] if fallback else []
 
 def source_pool_public_data() -> dict[str, Any]:
@@ -794,6 +819,8 @@ def add_manual_source(url: str) -> dict[str, Any]:
     if not normalized_url:
         raise ValueError("源地址格式不正确，必须是 http/https")
     pool = load_source_pool()
+    deleted_urls = [item for item in normalize_deleted_source_urls(pool.get("deleted_urls", [])) if item != normalized_url]
+    pool["deleted_urls"] = deleted_urls
     sources = [dict(item) for item in pool.get("sources", [])]
     for item in sources:
         if normalize_source_url(item.get("url")) == normalized_url:
@@ -806,19 +833,25 @@ def add_manual_source(url: str) -> dict[str, Any]:
     pool["sources"] = sources
     return save_source_pool(pool)
 
-def delete_manual_source(url: str) -> dict[str, Any]:
+def delete_source(url: str) -> dict[str, Any]:
     normalized_url = normalize_source_url(url)
+    if not normalized_url:
+        raise ValueError("源地址不能为空")
     pool = load_source_pool()
     kept: list[dict[str, Any]] = []
     removed = False
     for item in pool.get("sources", []):
-        if normalize_source_url(item.get("url")) == normalized_url and item.get("type") == "manual":
+        if normalize_source_url(item.get("url")) == normalized_url:
             removed = True
             continue
         kept.append(dict(item))
     if not removed:
-        raise ValueError("只允许删除手动源")
+        raise ValueError("未找到对应的源")
     pool["sources"] = kept
+    deleted_urls = normalize_deleted_source_urls(pool.get("deleted_urls", []))
+    if normalized_url not in deleted_urls:
+        deleted_urls.append(normalized_url)
+    pool["deleted_urls"] = deleted_urls
     return save_source_pool(pool)
 
 def update_source_flags(url: str, *, enabled: bool | None = None, selected: bool | None = None) -> dict[str, Any]:
@@ -831,20 +864,17 @@ def update_source_flags(url: str, *, enabled: bool | None = None, selected: bool
     for item in pool.get("sources", []):
         current = dict(item)
         if normalize_source_url(current.get("url")) == normalized_url:
-            if enabled is not None:
-                current["enabled"] = bool(enabled)
-            if selected is not None:
-                current["selected"] = bool(selected)
+            next_enabled = enabled
+            if next_enabled is None and selected is not None:
+                next_enabled = bool(selected)
+            if next_enabled is not None:
+                current["enabled"] = bool(next_enabled)
+                current["selected"] = bool(next_enabled)
             changed = True
         updated_sources.append(current)
     if not changed:
         raise ValueError("未找到对应的源")
     pool["sources"] = updated_sources
-    return save_source_pool(pool)
-
-def update_source_preferences(use_selected_only: bool) -> dict[str, Any]:
-    pool = load_source_pool()
-    pool["use_selected_only"] = bool(use_selected_only)
     return save_source_pool(pool)
 
 def safe_name(value: str) -> str:
@@ -1812,7 +1842,6 @@ def schedule_followup_tests(limit: int | None = None) -> None:
                 ][:max_nodes]
             if not node_ids:
                 return
-            log_to_json("INFO", "Main", f"后台续测启动，准备检测 {len(node_ids)} 个待检测节点")
             set_node_testing_state(node_ids, True)
             try:
                 test_multiple_nodes(node_ids)
@@ -2126,13 +2155,22 @@ def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> st
             candidates = fetch_candidates()
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
+            failed_at = time.time()
+            cooldown_until = failed_at + AUTO_REFRESH_COOLDOWN_SECONDS if not force else 0.0
+            message = f"抓取节点失败: {exc}"
+            if cooldown_until > 0:
+                message += "，自动补抓进入 1 小时冷却"
             set_state(
-                last_fetch_at=time.time(),
+                last_fetch_at=failed_at,
                 last_fetch_status="error",
-                last_fetch_message=str(exc),
+                last_fetch_message=message,
+                last_check_at=failed_at,
+                last_check_message=message,
+                auto_refresh_completed_at=failed_at,
+                auto_refresh_cooldown_until=cooldown_until,
                 is_connecting=False,
             )
-            return f"抓取节点失败: {exc}"
+            return message
 
         with lock:
             old_nodes = read_json(NODES_FILE, [])
@@ -3940,7 +3978,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Source Modal (API 源管理) -->
   <div id="source_modal" class="modal">
-    <div class="modal-content" style="max-width: 920px; width: 96%;">
+    <div class="modal-content" style="max-width: 860px; width: 96%;">
       <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h16" /></svg>
@@ -3954,11 +3992,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="source_error" style="display: none; color: var(--danger); font-size: 13px; margin-bottom: 14px; padding: 8px 12px; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.2); border-radius: 8px;"></div>
       <div id="source_success" style="display: none; color: var(--success); font-size: 13px; margin-bottom: 14px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 8px;"></div>
 
-      <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px;">
-        <label style="display: inline-flex; align-items: center; gap: 8px; color: var(--text-primary); font-size: 13px; cursor: pointer;">
-          <input type="checkbox" id="source_use_selected_only" style="accent-color: #22c55e;">
-          <span>只使用我勾选的源</span>
-        </label>
+      <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px;">
         <input id="source_add_input" class="input-field" placeholder="输入手动源地址，支持域名或完整 api/iphone/ 地址" style="flex: 1 1 320px; min-width: 260px;">
         <button id="source_add_btn" type="button" class="btn-primary" style="height: 40px; padding: 0 18px;">添加手动源</button>
         <button id="source_scan_btn" type="button" class="btn-primary" style="height: 40px; padding: 0 18px; background: var(--success-gradient);">立即扫描</button>
@@ -3976,21 +4010,20 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="table-wrapper" style="margin-bottom: 0;">
         <div class="table-container" style="max-height: 420px; overflow: auto;">
-          <table>
+          <table style="width: 100%; table-layout: fixed;">
             <thead>
               <tr>
-                <th style="width: 96px;">状态</th>
-                <th style="width: 96px;">类型</th>
+                <th style="width: 84px;">状态</th>
+                <th style="width: 76px;">类型</th>
                 <th>地址</th>
-                <th style="width: 88px;">勾选</th>
-                <th style="width: 88px;">启用</th>
-                <th style="width: 100px;">连续失败</th>
-                <th style="width: 120px;">操作</th>
+                <th style="width: 68px;">启用</th>
+                <th style="width: 72px;">失败</th>
+                <th style="width: 84px;">操作</th>
               </tr>
             </thead>
             <tbody id="source_rows">
               <tr>
-                <td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 20px 0;">正在加载源列表...</td>
+                <td colspan="6" style="text-align: center; color: var(--text-secondary); padding: 20px 0;">正在加载源列表...</td>
               </tr>
             </tbody>
           </table>
@@ -4948,7 +4981,6 @@ $("refresh").onclick=async()=>{
     $("refresh").textContent="更新节点";
   }, 3000);
 };
-$("source_use_selected_only").onchange = saveSourcePreferences;
 $("source_add_btn").onclick = addSource;
 $("source_scan_btn").onclick = triggerSourceScan;
 $("source_add_input").addEventListener("keydown", (event) => {
@@ -5190,19 +5222,28 @@ function sourceStatusBadge(item) {
 function setSourceActionBusy(busy) {
   const scanBtn = $("source_scan_btn");
   const addBtn = $("source_add_btn");
-  const selectedOnly = $("source_use_selected_only");
   const addInput = $("source_add_input");
   if (scanBtn) scanBtn.disabled = !!busy;
   if (addBtn) addBtn.disabled = !!busy;
-  if (selectedOnly) selectedOnly.disabled = !!busy;
   if (addInput) addInput.disabled = !!busy;
+}
+
+async function readSourceJsonResponse(res, fallbackMessage) {
+  const rawText = await res.text();
+  if (!rawText.trim()) {
+    throw new Error(fallbackMessage || "服务器返回了空响应，请稍后重试");
+  }
+  try {
+    return JSON.parse(rawText);
+  } catch (err) {
+    throw new Error(fallbackMessage || "服务器返回的数据不完整，请稍后重试");
+  }
 }
 
 function renderSources() {
   const rows = $("source_rows");
   if (!rows) return;
   const sources = sourcePool?.sources || [];
-  const useSelectedOnly = Boolean(sourcePool?.use_selected_only);
   const scanRunning = Boolean(sourcePool?.scan_running);
   const healthyCount = sources.filter(item => item && item.healthy).length;
 
@@ -5210,7 +5251,6 @@ function renderSources() {
   $("source_healthy_count_text").textContent = String(healthyCount);
   $("source_last_scan_time_text").textContent = time(sourcePool?.last_scan_at || 0);
   $("source_last_scan_message").textContent = sourcePool?.last_scan_message || "暂无扫描记录";
-  $("source_use_selected_only").checked = useSelectedOnly;
 
   const scanBtn = $("source_scan_btn");
   if (scanBtn) {
@@ -5219,7 +5259,7 @@ function renderSources() {
   }
 
   if (!sources.length) {
-    rows.innerHTML = `<tr><td colspan="7" style="text-align:center; color: var(--text-secondary); padding: 20px 0;">当前还没有可管理的源</td></tr>`;
+    rows.innerHTML = `<tr><td colspan="6" style="text-align:center; color: var(--text-secondary); padding: 20px 0;">当前还没有可管理的源</td></tr>`;
     return;
   }
 
@@ -5230,25 +5270,17 @@ function renderSources() {
     const details = [];
     if (item?.last_http_code) details.push(`HTTP ${item.last_http_code}`);
     if (item?.last_error) details.push(item.last_error);
-    const detailText = details.length ? `<div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">${esc(details.join(" | "))}</div>` : "";
-    const lastCheckText = item?.last_checked_at ? `<div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">上次检测: ${esc(time(item.last_checked_at))}</div>` : "";
-    const deleteBtn = item?.type === "manual"
-      ? `<button type="button" class="connect-btn" style="border-color: rgba(244,63,94,0.35); color: #fecdd3;" onclick="deleteSource('${urlToken}')">删除</button>`
-      : `<span style="font-size: 12px; color: var(--text-secondary);">-</span>`;
+    if (item?.last_checked_at) details.push(`检测 ${time(item.last_checked_at)}`);
+    const detailText = details.length ? `<div style="font-size: 12px; color: var(--text-secondary); margin-top: 3px; line-height: 1.5;">${esc(details.join(" · "))}</div>` : "";
+    const deleteBtn = `<button type="button" class="connect-btn" style="border-color: rgba(244,63,94,0.35); color: #fecdd3;" onclick="deleteSource('${urlToken}')">删除</button>`;
 
     return `
       <tr>
         <td><span class="badge ${badge.className}">${badge.text}</span></td>
         <td>${esc(sourceTypeText(item?.type))}</td>
-        <td class="mono" style="font-size: 12px; line-height: 1.6; word-break: break-all;">
+        <td class="mono" style="font-size: 12px; line-height: 1.5; word-break: break-all; padding-right: 8px;">
           ${esc(url)}
           ${detailText}
-          ${lastCheckText}
-        </td>
-        <td>
-          <label style="display:flex; justify-content:center; cursor:pointer;">
-            <input type="checkbox" ${item?.selected ? "checked" : ""} onchange="toggleSourceSelected('${urlToken}', this.checked)" style="accent-color: #22c55e;">
-          </label>
         </td>
         <td>
           <label style="display:flex; justify-content:center; cursor:pointer;">
@@ -5266,7 +5298,7 @@ async function loadSources(options = {}) {
   const { silent = false } = options;
   try {
     const res = await fetch("./api/sources");
-    const data = await res.json();
+    const data = await readSourceJsonResponse(res, "加载源列表失败：服务器返回异常");
     if (!res.ok || !data.ok) {
       throw new Error(data.error || "加载源列表失败");
     }
@@ -5303,26 +5335,6 @@ function closeSourceModal() {
   }
 }
 
-async function saveSourcePreferences() {
-  const checkbox = $("source_use_selected_only");
-  try {
-    const res = await fetch("./api/source_preferences", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ use_selected_only: !!checkbox.checked })
-    });
-    const data = await res.json();
-    if (!res.ok || !data.ok) {
-      throw new Error(data.error || "保存失败");
-    }
-    setSourceBanner("success", "源使用偏好已保存");
-    await loadSources({ silent: true });
-  } catch (err) {
-    checkbox.checked = !checkbox.checked;
-    setSourceBanner("error", err?.message || "保存失败");
-  }
-}
-
 async function addSource() {
   const input = $("source_add_input");
   const url = input.value.trim();
@@ -5337,7 +5349,7 @@ async function addSource() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url })
     });
-    const data = await res.json();
+    const data = await readSourceJsonResponse(res, "添加手动源失败：服务器返回异常");
     if (!res.ok || !data.ok) {
       throw new Error(data.error || "添加手动源失败");
     }
@@ -5355,7 +5367,7 @@ async function triggerSourceScan() {
   setSourceActionBusy(true);
   try {
     const res = await fetch("./api/source_scan", { method: "POST" });
-    const data = await res.json();
+    const data = await readSourceJsonResponse(res, "启动源扫描失败：服务器返回异常");
     if (!res.ok || !data.ok) {
       throw new Error(data.error || "启动源扫描失败");
     }
@@ -5379,7 +5391,7 @@ async function updateSourceFlag(url, payload) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url, ...payload })
     });
-    const data = await res.json();
+    const data = await readSourceJsonResponse(res, "更新源设置失败：服务器返回异常");
     if (!res.ok || !data.ok) {
       throw new Error(data.error || "更新源设置失败");
     }
@@ -5393,17 +5405,12 @@ async function updateSourceFlag(url, payload) {
 
 async function toggleSourceEnabled(urlToken, enabled) {
   const url = decodeURIComponent(urlToken);
-  await updateSourceFlag(url, { enabled: !!enabled });
-}
-
-async function toggleSourceSelected(urlToken, selected) {
-  const url = decodeURIComponent(urlToken);
-  await updateSourceFlag(url, { selected: !!selected });
+  await updateSourceFlag(url, { enabled: !!enabled, selected: !!enabled });
 }
 
 async function deleteSource(urlToken) {
   const url = decodeURIComponent(urlToken);
-  if (!confirm("确定要删除这个手动源吗？")) {
+  if (!confirm("确定要删除这个源吗？")) {
     await loadSources({ silent: true });
     return;
   }
@@ -5413,14 +5420,14 @@ async function deleteSource(urlToken) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url })
     });
-    const data = await res.json();
+    const data = await readSourceJsonResponse(res, "删除源失败：服务器返回异常");
     if (!res.ok || !data.ok) {
-      throw new Error(data.error || "删除手动源失败");
+      throw new Error(data.error || "删除源失败");
     }
-    setSourceBanner("success", data.message || "手动源已删除");
+    setSourceBanner("success", data.message || "源已删除");
     await loadSources({ silent: true });
   } catch (err) {
-    setSourceBanner("error", err?.message || "删除手动源失败");
+    setSourceBanner("error", err?.message || "删除源失败");
     await loadSources({ silent: true });
   }
 }
@@ -5872,6 +5879,7 @@ def check_proxy_health() -> dict[str, Any]:
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting, proxy_health_failures
     time.sleep(30)
+    last_proxy_log_signature: tuple[str, str] | None = None
     while True:
         last_checker_heartbeat = time.time()
         try:
@@ -5882,19 +5890,26 @@ def background_proxy_checker() -> None:
             res = check_proxy_health()
             if res["ok"]:
                 proxy_health_failures = 0
+                proxy_ip = str(res.get("ip") or "-")
+                proxy_latency_ms = parse_int(res.get("latency_ms"))
+                log_signature = ("ok", proxy_ip)
                 set_state(
                     proxy_ok=True,
-                    proxy_ip=res["ip"],
-                    proxy_latency_ms=res["latency_ms"],
+                    proxy_ip=proxy_ip,
+                    proxy_latency_ms=proxy_latency_ms,
                     proxy_error=""
                 )
-                log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
+                if log_signature != last_proxy_log_signature:
+                    log_to_json("INFO", "Proxy", f"代理可用，IP: {proxy_ip}, 延迟: {proxy_latency_ms} ms")
+                    last_proxy_log_signature = log_signature
             else:
                 error_msg = res.get("error", "未知错误")
                 proxy_health_failures += 1
-                if active_openvpn_node_id:
+                log_signature = ("error", str(error_msg))
+                if active_openvpn_node_id and log_signature != last_proxy_log_signature:
                     print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理当前不可用！原因: {error_msg}", flush=True)
                     log_to_json("WARNING", "Proxy", f"代理不可用 (连续失败 {proxy_health_failures}/{PROXY_HEALTH_FAILURE_THRESHOLD}): {error_msg}")
+                    last_proxy_log_signature = log_signature
                 set_state(
                     proxy_ok=False,
                     proxy_ip="-",
@@ -6281,8 +6296,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                save_pool = delete_manual_source(str(payload.get("url") or ""))
-                self.send_json({"ok": True, "message": "手动源已删除", "sources": save_pool.get("sources", [])})
+                save_pool = delete_source(str(payload.get("url") or ""))
+                self.send_json({"ok": True, "message": "源已删除", "sources": save_pool.get("sources", [])})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
