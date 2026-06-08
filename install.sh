@@ -306,59 +306,6 @@ def get_active_node_info():
             pass
     return None, None
 
-def format_http_url(host, port, suffix=""):
-    host = str(host or "").strip().strip("[]")
-    if not host:
-        return ""
-    suffix = str(suffix or "").strip()
-    if suffix and not suffix.startswith("/"):
-        suffix = "/" + suffix
-    if ":" in host:
-        host = f"[{host}]"
-    return f"http://{host}:{port}{suffix}"
-
-def get_ui_access_endpoints(cfg, ui_port, secret_path):
-    host_cfg = str(cfg.get("host", "::") or "::").strip()
-    path_suffix = f"/{secret_path}/" if secret_path else "/"
-    endpoints = {
-        "primary_url": "",
-        "public_url_v4": "",
-        "public_url_v6": "",
-        "local_url": "",
-        "local_ipv6_url": "",
-    }
-
-    if host_cfg in ("127.0.0.1", "localhost"):
-        endpoints["local_url"] = format_http_url("127.0.0.1", ui_port, path_suffix)
-        endpoints["primary_url"] = endpoints["local_url"]
-        return endpoints
-    if host_cfg == "::1":
-        endpoints["local_ipv6_url"] = format_http_url("::1", ui_port, path_suffix)
-        endpoints["primary_url"] = endpoints["local_ipv6_url"]
-        return endpoints
-    if host_cfg in ("0.0.0.0", ""):
-        endpoints["public_url_v4"] = format_http_url(get_public_ipv4(), ui_port, path_suffix)
-        endpoints["local_url"] = format_http_url("127.0.0.1", ui_port, path_suffix)
-        endpoints["primary_url"] = endpoints["public_url_v4"] or endpoints["local_url"]
-        return endpoints
-    if host_cfg == "::":
-        endpoints["public_url_v4"] = format_http_url(get_public_ipv4(), ui_port, path_suffix)
-        endpoints["public_url_v6"] = format_http_url(get_public_ipv6(), ui_port, path_suffix)
-        endpoints["local_url"] = format_http_url("127.0.0.1", ui_port, path_suffix)
-        endpoints["local_ipv6_url"] = format_http_url("::1", ui_port, path_suffix)
-        endpoints["primary_url"] = endpoints["public_url_v4"] or endpoints["public_url_v6"] or endpoints["local_url"]
-        return endpoints
-    if ":" in host_cfg:
-        endpoints["public_url_v6"] = format_http_url(host_cfg, ui_port, path_suffix)
-        endpoints["local_ipv6_url"] = format_http_url("::1", ui_port, path_suffix)
-        endpoints["primary_url"] = endpoints["public_url_v6"]
-        return endpoints
-
-    endpoints["public_url_v4"] = format_http_url(host_cfg, ui_port, path_suffix)
-    endpoints["local_url"] = endpoints["public_url_v4"]
-    endpoints["primary_url"] = endpoints["public_url_v4"]
-    return endpoints
-
 def get_proxy_access_endpoints(state, proxy_port):
     import urllib.parse
     local_proxy = state.get("local_proxy", f"http://0.0.0.0:{proxy_port}")
@@ -369,49 +316,35 @@ def get_proxy_access_endpoints(state, proxy_port):
     except Exception:
         proxy_host = "0.0.0.0"
 
-    endpoints = {
-        "public_url": "",
-        "public_url_v4": "",
-        "public_url_v6": "",
-        "local_url": "",
-        "local_ipv6_url": "",
-        "local_socks_host": "127.0.0.1",
-    }
-
-    if proxy_host in ("0.0.0.0", ""):
-        endpoints["public_url_v4"] = format_http_url(get_public_ipv4(), proxy_port)
-        endpoints["public_url"] = endpoints["public_url_v4"]
-        endpoints["local_url"] = format_http_url("127.0.0.1", proxy_port)
-        return endpoints
-    if proxy_host == "::":
-        endpoints["public_url_v4"] = format_http_url(get_public_ipv4(), proxy_port)
-        endpoints["public_url_v6"] = format_http_url(get_public_ipv6(), proxy_port)
-        endpoints["public_url"] = endpoints["public_url_v4"] or endpoints["public_url_v6"]
-        endpoints["local_url"] = format_http_url("127.0.0.1", proxy_port)
-        endpoints["local_ipv6_url"] = format_http_url("::1", proxy_port)
-        return endpoints
+    if proxy_host in ("0.0.0.0", "", "::"):
+        public_host = get_public_ip()
+        return {
+            "public_url": f"http://{public_host}:{proxy_port}" if public_host else "",
+            "local_url": f"http://127.0.0.1:{proxy_port}",
+            "local_socks_host": "127.0.0.1",
+        }
     if proxy_host in ("127.0.0.1", "localhost"):
-        endpoints["local_url"] = format_http_url("127.0.0.1", proxy_port)
-        return endpoints
+        return {
+            "public_url": "",
+            "local_url": f"http://127.0.0.1:{proxy_port}",
+            "local_socks_host": "127.0.0.1",
+        }
     if proxy_host == "::1":
-        endpoints["local_ipv6_url"] = format_http_url("::1", proxy_port)
-        endpoints["local_socks_host"] = "[::1]"
-        return endpoints
+        return {
+            "public_url": "",
+            "local_url": f"http://[::1]:{proxy_port}",
+            "local_socks_host": "[::1]",
+        }
     if ":" in proxy_host:
-        proxy_url = format_http_url(proxy_host, proxy_port)
-        endpoints["public_url"] = proxy_url
-        endpoints["public_url_v6"] = proxy_url
-        endpoints["local_url"] = proxy_url
-        endpoints["local_ipv6_url"] = format_http_url("::1", proxy_port)
-        endpoints["local_socks_host"] = f"[{proxy_host}]"
-        return endpoints
-
-    proxy_url = format_http_url(proxy_host, proxy_port)
-    endpoints["public_url"] = proxy_url
-    endpoints["public_url_v4"] = proxy_url
-    endpoints["local_url"] = proxy_url
-    endpoints["local_socks_host"] = proxy_host
-    return endpoints
+        proxy_url = f"http://[{proxy_host}]:{proxy_port}"
+        proxy_host = f"[{proxy_host}]"
+    else:
+        proxy_url = f"http://{proxy_host}:{proxy_port}"
+    return {
+        "public_url": proxy_url,
+        "local_url": proxy_url,
+        "local_socks_host": proxy_host,
+    }
 
 def ping_ip(ip):
     if not ip:
@@ -434,57 +367,34 @@ def ping_ip(ip):
     except Exception:
         return "无法连接"
 
-def read_cached_public_ip(filename):
-    path = f"/opt/aimilivpn/vpngate_data/{filename}"
+def get_public_ip():
+    path = "/opt/aimilivpn/vpngate_data/public_ip.txt"
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return f.read().strip()
+                ip = f.read().strip()
+                if ip:
+                    return ip
         except Exception:
             pass
-    return ""
-
-def fetch_public_ip(api_urls, cache_filename):
     import urllib.request
-    path = f"/opt/aimilivpn/vpngate_data/{cache_filename}"
-    for api_url in api_urls:
+    # Try dual-stack first, then IPv6-only, then IPv4-only
+    for api_url in ["https://api64.ipify.org", "https://api6.ipify.org", "https://api.ipify.org"]:
         try:
             req = urllib.request.Request(api_url, headers={"User-Agent": "curl/7.68.0"})
             with urllib.request.urlopen(req, timeout=2) as r:
                 ip = r.read().decode().strip()
-                if not ip:
-                    continue
-                try:
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(ip)
-                except Exception:
-                    pass
-                return ip
+                if ip:
+                    try:
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        with open(path, "w", encoding="utf-8") as f:
+                            f.write(ip)
+                    except Exception:
+                        pass
+                    return ip
         except Exception:
             pass
-    return ""
-
-def get_public_ipv4():
-    cached = read_cached_public_ip("public_ip.txt")
-    if cached and ":" not in cached:
-        return cached
-    return fetch_public_ip(
-        ["https://api.ipify.org", "https://ifconfig.me/ip", "https://ipv4.icanhazip.com"],
-        "public_ip.txt",
-    )
-
-def get_public_ipv6():
-    cached = read_cached_public_ip("public_ipv6.txt")
-    if cached and ":" in cached:
-        return cached
-    return fetch_public_ip(
-        ["https://api6.ipify.org", "https://ipv6.icanhazip.com"],
-        "public_ipv6.txt",
-    )
-
-def get_public_ip():
-    return get_public_ipv4() or get_public_ipv6() or "您的服务器公网IP"
+    return "您的服务器公网IP"
 
 def check_port_listening(port):
     for host, family in [("127.0.0.1", socket.AF_INET), ("::1", socket.AF_INET6)]:
@@ -591,32 +501,26 @@ def print_status():
     print_line(format_line(f"管理后台 (Port {ui_port})", backend_status))
     print_line(format_line("连接核心 (OpenVPN)", openvpn_status))
     
-    ui_endpoints = get_ui_access_endpoints(cfg, ui_port, secret_path)
-    login_url = ui_endpoints["primary_url"] or format_http_url("127.0.0.1", ui_port, f"/{secret_path}/")
-    print_line(format_line("网页登录地址", f"{yellow}{login_url}{reset}"))
-    if ui_endpoints["public_url_v6"] and ui_endpoints["public_url_v6"] != login_url:
-        print_line(format_line("网页登录地址(IPv6)", f"{yellow}{ui_endpoints['public_url_v6']}{reset}"))
+    host_cfg = cfg.get("host", "::")
+    if host_cfg in ("127.0.0.1", "localhost"):
+        login_ip = "127.0.0.1"
+    elif host_cfg == "::1":
+        login_ip = "[::1]"
+    elif host_cfg == "::":
+        login_ip = get_public_ip()
+    else:
+        login_ip = f"[{host_cfg}]" if ":" in host_cfg else host_cfg
+    print_line(format_line("网页登录地址", f"{yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}"))
     print_line(format_line("网页管理账号", cfg.get("username", "未配置")))
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
     proxy_endpoints = get_proxy_access_endpoints(state, proxy_port)
-    proxy_entry = (
-        state.get("proxy_entry")
-        or proxy_endpoints["public_url"]
-        or proxy_endpoints["public_url_v6"]
-        or proxy_endpoints["local_url"]
-        or proxy_endpoints["local_ipv6_url"]
-    )
+    proxy_entry = state.get("proxy_entry") or proxy_endpoints["public_url"] or proxy_endpoints["local_url"]
     print_line(format_line("代理入口(当前)", f"{yellow}{proxy_entry}/{reset}"))
-    if proxy_endpoints["public_url_v6"] and proxy_endpoints["public_url_v6"] != proxy_entry:
-        print_line(format_line("代理入口(当前 IPv6)", f"{yellow}{proxy_endpoints['public_url_v6']}/{reset}"))
     if proxy_endpoints["public_url"] and proxy_endpoints["public_url"] != proxy_entry:
         print_line(format_line("代理入口(公网)", f"{yellow}{proxy_endpoints['public_url']}/{reset}"))
-    local_proxy_url = proxy_endpoints["local_url"] or proxy_endpoints["local_ipv6_url"]
-    print_line(format_line("代理入口(本机调试)", f"{yellow}{local_proxy_url}/{reset}"))
-    if proxy_endpoints["local_ipv6_url"] and proxy_endpoints["local_ipv6_url"] != local_proxy_url:
-        print_line(format_line("代理入口(本机 IPv6)", f"{yellow}{proxy_endpoints['local_ipv6_url']}/{reset}"))
+    print_line(format_line("代理入口(本机调试)", f"{yellow}{proxy_endpoints['local_url']}/{reset}"))
     print_line()
     print_line("【活动节点状态】")
     if is_connecting:
@@ -1380,7 +1284,6 @@ echo -n "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
 # Get VPS public IPv6
 echo -e "正在获取 VPS 公网 IPv6..."
 PUBLIC_IPV6=$(curl -6 -s --max-time 3 https://api.ipify.org || curl -6 -s --max-time 3 https://ifconfig.me || curl -6 -s --max-time 3 icanhazip.com || echo "")
-echo -n "$PUBLIC_IPV6" > "${INSTALL_DIR}/vpngate_data/public_ipv6.txt"
 
 echo -e "\n${GREEN}==========================================================${PLAIN}"
 echo -e "${GREEN}             AimiliVPN 源码一键部署已完成！${PLAIN}"
