@@ -3500,9 +3500,9 @@ INDEX_HTML = r"""<!doctype html>
     .nodes-table .col-location { width: 148px; }
     .nodes-table .col-asn { width: 150px; }
     .nodes-table .col-owner { width: 150px; }
-    .nodes-table .col-quality { width: 90px; }
-    .nodes-table .col-ip-type { width: 86px; }
-    .nodes-table .col-actions { width: 136px; }
+    .nodes-table .col-quality { width: 78px; }
+    .nodes-table .col-ip-type { width: 74px; }
+    .nodes-table .col-actions { width: 122px; }
 
     .nodes-table tr {
       transition: background 0.2s ease;
