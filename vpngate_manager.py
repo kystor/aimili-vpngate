@@ -107,6 +107,7 @@ MAX_CONCURRENT_TEST_WORKERS = int(os.environ.get("MAX_CONCURRENT_TEST_WORKERS", 
 MAX_BATCH_TEST_REQUEST_SIZE = int(os.environ.get("MAX_BATCH_TEST_REQUEST_SIZE", "12"))
 MAX_MAINTAIN_TEST_NODES = int(os.environ.get("MAX_MAINTAIN_TEST_NODES", "12"))
 FOLLOWUP_TEST_BATCH_SIZE = int(os.environ.get("FOLLOWUP_TEST_BATCH_SIZE", "5"))
+AVAILABLE_RECHECK_INTERVAL_SECONDS = int(os.environ.get("AVAILABLE_RECHECK_INTERVAL_SECONDS", str(3 * 60 * 60)))
 SOURCE_SCAN_CANDIDATE_LIMIT = int(os.environ.get("SOURCE_SCAN_CANDIDATE_LIMIT", "10"))
 FETCH_SOURCE_LIMIT = int(os.environ.get("FETCH_SOURCE_LIMIT", "5"))
 SOURCE_DELETE_FAILURE_THRESHOLD = int(os.environ.get("SOURCE_DELETE_FAILURE_THRESHOLD", "3"))
@@ -142,6 +143,9 @@ maintain_job_lock = threading.Lock()
 followup_test_lock = threading.Lock()
 source_scan_lock = threading.Lock()
 heavy_task_lock = threading.RLock()
+available_recheck_lock = threading.Lock()
+system_update_lock = threading.Lock()
+available_recheck_pending = False
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -405,6 +409,15 @@ def get_state() -> dict[str, Any]:
     state.setdefault("auto_refresh_completed_at", 0.0)
     state.setdefault("auto_refresh_cooldown_until", 0.0)
     state.setdefault("last_auto_refresh_reason", "")
+    state.setdefault("available_recheck_interval_seconds", AVAILABLE_RECHECK_INTERVAL_SECONDS)
+    state.setdefault("last_available_recheck_started_at", 0.0)
+    state.setdefault("last_available_recheck_completed_at", 0.0)
+    state.setdefault("available_recheck_message", "")
+    state.setdefault("available_recheck_running", False)
+    state.setdefault("available_recheck_pending", False)
+    state.setdefault("system_update_running", False)
+    state.setdefault("system_update_message", "")
+    state.setdefault("system_update_finished_at", 0.0)
     state["local_proxy"] = get_proxy_listen_url()
     state["proxy_entry"] = get_proxy_display_url()
 
@@ -1885,6 +1898,117 @@ def schedule_followup_tests(limit: int | None = None) -> None:
 
     threading.Thread(target=worker, daemon=True).start()
 
+def schedule_available_recheck(reason: str = "周期复检到期") -> bool:
+    global available_recheck_pending
+    with lock:
+        if available_recheck_pending or available_recheck_lock.locked():
+            return False
+        available_recheck_pending = True
+    set_state(available_recheck_pending=True, available_recheck_message=f"{reason}，已加入后台队列")
+
+    def worker() -> None:
+        global available_recheck_pending
+        with available_recheck_lock:
+            started_at = time.time()
+            acquired_heavy_lock = False
+            try:
+                set_state(
+                    available_recheck_running=True,
+                    available_recheck_pending=False,
+                    last_available_recheck_started_at=started_at,
+                    available_recheck_message="正在后台周期复检全部可用节点",
+                )
+                heavy_task_lock.acquire()
+                acquired_heavy_lock = True
+                with lock:
+                    current_nodes = read_json(NODES_FILE, [])
+                    node_ids = [str(node.get("id") or "") for node in current_nodes if node.get("probe_status") == "available"]
+                if not node_ids:
+                    completed_at = time.time()
+                    set_state(
+                        available_recheck_running=False,
+                        last_available_recheck_completed_at=completed_at,
+                        available_recheck_message="当前没有可供周期复检的可用节点",
+                    )
+                    return
+
+                set_node_testing_state(node_ids, True)
+                try:
+                    test_multiple_nodes(node_ids)
+                finally:
+                    set_node_testing_state(node_ids, False)
+
+                completed_at = time.time()
+                set_state(
+                    available_recheck_running=False,
+                    last_available_recheck_completed_at=completed_at,
+                    available_recheck_message=f"周期复检完成，本轮共检测 {len(node_ids)} 个可用节点",
+                )
+                log_to_json("INFO", "Main", f"周期复检完成，共检测 {len(node_ids)} 个可用节点")
+            except Exception as exc:
+                completed_at = time.time()
+                print(f"[周期复检] 后台任务失败: {exc}", flush=True)
+                log_to_json("WARNING", "Main", f"周期复检失败: {exc}")
+                set_state(
+                    available_recheck_running=False,
+                    last_available_recheck_completed_at=completed_at,
+                    available_recheck_message=f"周期复检失败: {exc}",
+                )
+            finally:
+                with lock:
+                    available_recheck_pending = False
+                set_state(available_recheck_pending=False)
+                if acquired_heavy_lock:
+                    heavy_task_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+def start_system_update() -> tuple[bool, str]:
+    if not system_update_lock.acquire(blocking=False):
+        return False, "系统更新任务已在执行中，请稍后再试"
+
+    install_script = Path("/opt/aimilivpn/install.sh")
+    if not install_script.exists():
+        install_script = ROOT_DIR / "install.sh"
+    if not install_script.exists():
+        system_update_lock.release()
+        return False, "未找到可执行的正式版更新脚本"
+
+    set_state(
+        system_update_running=True,
+        system_update_message="正在后台执行系统更新，期间服务可能自动重启",
+        system_update_finished_at=0.0,
+    )
+
+    def worker() -> None:
+        try:
+            print(f"[系统更新] 开始执行更新脚本: {install_script}", flush=True)
+            log_to_json("INFO", "System", f"开始执行系统更新: {install_script}")
+            subprocess.run(["bash", str(install_script)], cwd=str(install_script.parent), check=True)
+            message = "系统更新命令已执行完成，如服务已重启请稍后刷新页面"
+            print(f"[系统更新] {message}", flush=True)
+            log_to_json("INFO", "System", message)
+            set_state(
+                system_update_running=False,
+                system_update_message=message,
+                system_update_finished_at=time.time(),
+            )
+        except Exception as exc:
+            message = f"系统更新失败: {exc}"
+            print(f"[系统更新] {message}", flush=True)
+            log_to_json("WARNING", "System", message)
+            set_state(
+                system_update_running=False,
+                system_update_message=message,
+                system_update_finished_at=time.time(),
+            )
+        finally:
+            system_update_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True, "已在后台启动系统更新，更新期间服务可能自动重启"
+
 def auto_switch_node(attempt: int = 0) -> None:
     global is_connecting
     if attempt >= 3:
@@ -1933,6 +2057,7 @@ def auto_switch_node(attempt: int = 0) -> None:
 
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting, proxy_health_failures
+    acquired_heavy_lock = False
     with lock:
         if is_connecting:
             return "已有连接任务正在执行"
@@ -1946,6 +2071,8 @@ def connect_node(node_id: str) -> str:
     )
 
     try:
+        heavy_task_lock.acquire()
+        acquired_heavy_lock = True
         nodes = read_json(NODES_FILE, [])
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
@@ -2047,6 +2174,8 @@ def connect_node(node_id: str) -> str:
         schedule_followup_tests(FOLLOWUP_TEST_BATCH_SIZE)
         return f"Connected {node_id}"
     finally:
+        if acquired_heavy_lock:
+            heavy_task_lock.release()
         with lock:
             is_connecting = False
 
@@ -2300,6 +2429,8 @@ def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> st
             routed_valid_nodes=routed_valid_nodes,
             auto_refresh_completed_at=refresh_completed_at,
             auto_refresh_cooldown_until=cooldown_until,
+            last_available_recheck_completed_at=refresh_completed_at,
+            available_recheck_message=f"完整节点测试完成，共确认 {valid_nodes_count} 个可用节点",
             active_openvpn_node_id=active_openvpn_node_id,
             is_connecting=False,
         )
@@ -2318,13 +2449,14 @@ def collector_loop() -> None:
         try:
             current_nodes = read_json(NODES_FILE, [])
             ui_cfg = load_ui_config()
+            now = time.time()
             total_valid_nodes = len([node for node in current_nodes if node.get("probe_status") == "available"])
             routed_valid_nodes = count_available_nodes_for_routing(current_nodes, ui_cfg)
             current_state = get_state()
-            if should_run_daily_source_scan(time.time()):
+            if should_run_daily_source_scan(now):
                 run_source_scan(force=False)
                 continue
-            should_refresh, refresh_reason = should_trigger_auto_refresh(current_state, routed_valid_nodes, time.time())
+            should_refresh, refresh_reason = should_trigger_auto_refresh(current_state, routed_valid_nodes, now)
             set_state(
                 valid_nodes=total_valid_nodes,
                 routed_valid_nodes=routed_valid_nodes,
@@ -2334,6 +2466,10 @@ def collector_loop() -> None:
                 run_node_refresh(force=False, disconnect_active=False)
             else:
                 schedule_followup_tests()
+                last_recheck_completed_at = float(current_state.get("last_available_recheck_completed_at", 0.0) or 0.0)
+                recheck_due = last_recheck_completed_at <= 0 or (now - last_recheck_completed_at) >= AVAILABLE_RECHECK_INTERVAL_SECONDS
+                if total_valid_nodes > 0 and recheck_due:
+                    schedule_available_recheck("可用节点周期复检到期")
         except Exception as exc:
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
 
@@ -3270,6 +3406,12 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
 
+    .wrap-cell {
+      white-space: normal;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+
     .proto-badge.tcp {
       background: rgba(96, 165, 250, 0.12);
       color: #93c5fd;
@@ -3323,14 +3465,16 @@ INDEX_HTML = r"""<!doctype html>
       overflow-x: auto;
     }
 
-    table {
+    .nodes-table {
       width: 100%;
       border-collapse: collapse;
       text-align: left;
-      min-width: 1320px;
+      min-width: 1500px;
+      table-layout: fixed;
     }
 
-    th, td {
+    .nodes-table th,
+    .nodes-table td {
       padding: 14px 20px;
       border-bottom: 1px solid var(--border-color);
       font-size: 14px;
@@ -3340,7 +3484,7 @@ INDEX_HTML = r"""<!doctype html>
       word-break: keep-all;
     }
 
-    th {
+    .nodes-table th {
       background: rgba(17, 24, 39, 0.4);
       font-size: 12px;
       font-weight: 700;
@@ -3349,11 +3493,22 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-secondary);
     }
 
-    tr {
+    .nodes-table .col-status { width: 110px; }
+    .nodes-table .col-latency { width: 92px; }
+    .nodes-table .col-address { width: 220px; }
+    .nodes-table .col-location { width: 230px; }
+    .nodes-table .col-asn { width: 190px; }
+    .nodes-table .col-owner { width: 230px; }
+    .nodes-table .col-proto { width: 90px; text-align: center; }
+    .nodes-table .col-quality { width: 110px; }
+    .nodes-table .col-ip-type { width: 110px; }
+    .nodes-table .col-actions { width: 170px; }
+
+    .nodes-table tr {
       transition: background 0.2s ease;
     }
 
-    tr:hover {
+    .nodes-table tr:hover {
       background: rgba(255, 255, 255, 0.015);
     }
 
@@ -3889,6 +4044,10 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
           日志
         </a>
+        <a href="javascript:void(0)" onclick="triggerSystemUpdate()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
+          更新系统
+        </a>
         <a href="javascript:void(0)" onclick="logoutAdmin()" style="color: var(--danger); border-top: 1px solid rgba(255,255,255,0.05);">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
           退出
@@ -3961,19 +4120,19 @@ INDEX_HTML = r"""<!doctype html>
   </section>
   <div class="table-wrapper">
     <div class="table-container">
-      <table>
+      <table class="nodes-table">
         <thead>
           <tr>
-            <th style="width: 110px;">状态</th>
-            <th style="width: 92px;">延迟</th>
-            <th style="width: 220px;">IP 地址 : 端口</th>
-            <th style="width: 220px;">物理位置</th>
-            <th style="width: 220px;">ASN</th>
-            <th style="width: 180px;">运营主体 / ISP</th>
-            <th style="width: 90px;">协议</th>
-            <th style="width: 110px;">网络质量</th>
-            <th style="width: 110px;">IP 类型</th>
-            <th style="width: 160px;">操作</th>
+            <th class="col-status">状态</th>
+            <th class="col-latency">延迟</th>
+            <th class="col-address">IP 地址 : 端口</th>
+            <th class="col-location">物理位置</th>
+            <th class="col-asn">ASN</th>
+            <th class="col-owner">运营主体 / ISP</th>
+            <th class="col-proto">协议</th>
+            <th class="col-quality">网络质量</th>
+            <th class="col-ip-type">IP 类型</th>
+            <th class="col-actions">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -4435,10 +4594,39 @@ function getCountryCountMap() {
   return countMap;
 }
 
+function matchesIpTypeFilter(node, selectedIpType) {
+  if (!selectedIpType) return true;
+  if (selectedIpType === "residential") {
+    return ["residential", "mobile"].includes(node.ip_type);
+  }
+  if (selectedIpType === "hosting") {
+    return node.ip_type === "hosting";
+  }
+  return true;
+}
+
+function matchesProtocolFilter(node, selectedProtocols) {
+  if (selectedProtocols.length === 0) return true;
+  const proto = normalizeProtoLabel(node.proto);
+  return selectedProtocols.includes(proto);
+}
+
+function getCountryFilterNodes() {
+  const selectedIpType = $("ip_type_filter").value;
+  const selectedProtocols = getListDisplayProtocols();
+  return nodes.filter(n => n && matchesIpTypeFilter(n, selectedIpType) && matchesProtocolFilter(n, selectedProtocols));
+}
+
 function updateCountryFilter() {
   const select = $("country_filter");
+  if (!select) return;
   const selectedValue = select.value;
-  const countMap = getCountryCountMap();
+  const countMap = {};
+  getCountryFilterNodes().forEach(n => {
+    if (n.country) {
+      countMap[n.country] = (countMap[n.country] || 0) + 1;
+    }
+  });
   const countries = Object.keys(countMap).sort();
   
   const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
@@ -4449,10 +4637,13 @@ function updateCountryFilter() {
     return;
   }
   
-  select.innerHTML = '<option value="">所有国家</option>' + 
-    countries.map(c => `<option value="${esc(c)}">${esc(c)} (${countMap[c]})</option>`).join("");
+  const optionHtml = countries.map(c => `<option value="${esc(c)}">${esc(c)} (${countMap[c]})</option>`).join("");
+  const selectedFallback = selectedValue && !countries.includes(selectedValue)
+    ? `<option value="${esc(selectedValue)}">${esc(selectedValue)} (0)</option>`
+    : "";
+  select.innerHTML = '<option value="">所有国家</option>' + selectedFallback + optionHtml;
   
-  if (countries.includes(selectedValue)) {
+  if (selectedValue) {
     select.value = selectedValue;
   } else {
     select.value = "";
@@ -4517,6 +4708,7 @@ function handleListProtocolFilterChange(event) {
   }
   setProtocolToggleState(button, nextActive);
   currentPage = 1;
+  updateCountryFilter();
   render();
 }
 
@@ -4527,22 +4719,14 @@ function getFilteredNodes() {
   const selectedProtocols = getListDisplayProtocols();
   return nodes.filter(n => {
     if (!n) return false;
-    if (selectedCountry && n.country !== selectedCountry) {
+    if (!matchesIpTypeFilter(n, selectedIpType)) {
       return false;
     }
-    if (selectedIpType) {
-      if (selectedIpType === "residential" && !["residential", "mobile"].includes(n.ip_type)) {
-        return false;
-      }
-      if (selectedIpType === "hosting" && n.ip_type !== "hosting") {
-        return false;
-      }
+    if (!matchesProtocolFilter(n, selectedProtocols)) {
+      return false;
     }
-    if (selectedProtocols.length > 0) {
-      const proto = normalizeProtoLabel(n.proto);
-      if (!selectedProtocols.includes(proto)) {
-        return false;
-      }
+    if (selectedCountry && n.country !== selectedCountry) {
+      return false;
     }
     const searchStr = [
       n.country || "", n.country_short || "", n.ip || "", n.remote_host || "", n.proto || "",
@@ -4764,16 +4948,16 @@ function render(){
         : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
       return `<tr ${rowClass}>
-        <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td class="latency-cell">${latencyText}</td>
-        <td class="mono nowrap-cell">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
-        <td>${esc(displayLocation)}</td>
-        <td class="mono" style="font-size:12px; color:var(--text-primary);">${esc(n.asn||"-")}</td>
-        <td>${esc(n.owner||n.as_name||"-")}</td>
-        <td><span class="proto-badge ${esc(protoClass)}">${esc(protoText)}</span></td>
-        <td class="nowrap-cell">${esc(translateQuality(n.quality))}</td>
-        <td class="nowrap-cell">${esc(translateIpType(n.ip_type))}</td>
-        <td>
+        <td class="col-status"><span class="badge ${badgeClass}">${badgeText}</span></td>
+        <td class="col-latency latency-cell">${latencyText}</td>
+        <td class="col-address mono nowrap-cell">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="col-location wrap-cell">${esc(displayLocation)}</td>
+        <td class="col-asn mono wrap-cell" style="font-size:12px; color:var(--text-primary);">${esc(n.asn||"-")}</td>
+        <td class="col-owner wrap-cell">${esc(n.owner||n.as_name||"-")}</td>
+        <td class="col-proto"><span class="proto-badge ${esc(protoClass)}">${esc(protoText)}</span></td>
+        <td class="col-quality nowrap-cell">${esc(translateQuality(n.quality))}</td>
+        <td class="col-ip-type nowrap-cell">${esc(translateIpType(n.ip_type))}</td>
+        <td class="col-actions">
           <div class="table-actions">
             ${testBtn}
             ${connectBtn}
@@ -5142,7 +5326,7 @@ async function load(){
 
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
-$("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
+$("ip_type_filter").onchange=()=>{ currentPage = 1; updateCountryFilter(); render(); };
 $("list_protocol_tcp").onclick = handleListProtocolFilterChange;
 $("list_protocol_udp").onclick = handleListProtocolFilterChange;
 $("header_routing_country").onchange = saveHeaderRouting;
@@ -5743,6 +5927,23 @@ async function saveNetwork(e) {
     errorDivEl.style.display = "block";
     submitBtn.disabled = false;
     submitBtn.textContent = "保存修改";
+  }
+}
+
+async function triggerSystemUpdate() {
+  $("admin_dropdown").style.display = "none";
+  if (!confirm("确认现在开始更新系统吗？更新期间服务可能自动重启。")) return;
+  try {
+    const res = await fetch("./api/update_system", { method: "POST" });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      alert(data.message || "已在后台启动系统更新");
+      setTimeout(() => load(), 1200);
+    } else {
+      alert(data.error || "启动系统更新失败");
+    }
+  } catch (err) {
+    alert("启动系统更新失败，请稍后重试");
   }
 }
 
@@ -6715,8 +6916,21 @@ class Handler(BaseHTTPRequestHandler):
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 node_ids = payload.get("ids", [])
-                tested_nodes = test_multiple_nodes(node_ids)
+                heavy_task_lock.acquire()
+                try:
+                    tested_nodes = test_multiple_nodes(node_ids)
+                finally:
+                    heavy_task_lock.release()
                 self.send_json({"ok": True, "nodes": tested_nodes})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/update_system":
+            try:
+                ok, message = start_system_update()
+                if ok:
+                    self.send_json({"ok": True, "message": message})
+                else:
+                    self.send_json({"ok": False, "error": message}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":
