@@ -111,7 +111,7 @@ SOURCE_SCAN_CANDIDATE_LIMIT = int(os.environ.get("SOURCE_SCAN_CANDIDATE_LIMIT", 
 FETCH_SOURCE_LIMIT = int(os.environ.get("FETCH_SOURCE_LIMIT", "5"))
 SOURCE_DELETE_FAILURE_THRESHOLD = int(os.environ.get("SOURCE_DELETE_FAILURE_THRESHOLD", "3"))
 MANUAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("MANUAL_TEST_TIMEOUT_SECONDS", "8"))
-KEEP_OLD_NODE_LATENCY_MS = int(os.environ.get("KEEP_OLD_NODE_LATENCY_MS", "50"))
+KEEP_OLD_NODE_LATENCY_MS = int(os.environ.get("KEEP_OLD_NODE_LATENCY_MS", "150"))
 MAX_CACHED_NODES = int(os.environ.get("MAX_CACHED_NODES", "1200"))
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
