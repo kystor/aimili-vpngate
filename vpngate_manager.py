@@ -3469,7 +3469,7 @@ INDEX_HTML = r"""<!doctype html>
       width: 100%;
       border-collapse: collapse;
       text-align: left;
-      min-width: 1220px;
+      min-width: 1140px;
       table-layout: fixed;
     }
 
@@ -3495,11 +3495,11 @@ INDEX_HTML = r"""<!doctype html>
 
     .nodes-table .col-status { width: 88px; }
     .nodes-table .col-latency { width: 72px; }
-    .nodes-table .col-address { width: 170px; }
-    .nodes-table .col-location { width: 168px; }
+    .nodes-table .col-address { width: 165px; }
+    .nodes-table .col-proto { width: 70px; text-align: center; }
+    .nodes-table .col-location { width: 148px; }
     .nodes-table .col-asn { width: 150px; }
-    .nodes-table .col-owner { width: 170px; }
-    .nodes-table .col-proto { width: 74px; text-align: center; }
+    .nodes-table .col-owner { width: 150px; }
     .nodes-table .col-quality { width: 90px; }
     .nodes-table .col-ip-type { width: 86px; }
     .nodes-table .col-actions { width: 136px; }
@@ -4126,10 +4126,10 @@ INDEX_HTML = r"""<!doctype html>
             <th class="col-status">状态</th>
             <th class="col-latency">延迟</th>
             <th class="col-address">IP 地址 : 端口</th>
+            <th class="col-proto">协议</th>
             <th class="col-location">物理位置</th>
             <th class="col-asn">ASN</th>
             <th class="col-owner">运营主体 / ISP</th>
-            <th class="col-proto">协议</th>
             <th class="col-quality">网络质量</th>
             <th class="col-ip-type">IP 类型</th>
             <th class="col-actions">操作</th>
@@ -4951,10 +4951,10 @@ function render(){
         <td class="col-status"><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td class="col-latency latency-cell">${latencyText}</td>
         <td class="col-address mono nowrap-cell">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="col-proto"><span class="proto-badge ${esc(protoClass)}">${esc(protoText)}</span></td>
         <td class="col-location wrap-cell">${esc(displayLocation)}</td>
         <td class="col-asn mono wrap-cell" style="font-size:12px; color:var(--text-primary);">${esc(n.asn||"-")}</td>
         <td class="col-owner wrap-cell">${esc(n.owner||n.as_name||"-")}</td>
-        <td class="col-proto"><span class="proto-badge ${esc(protoClass)}">${esc(protoText)}</span></td>
         <td class="col-quality nowrap-cell">${esc(translateQuality(n.quality))}</td>
         <td class="col-ip-type nowrap-cell">${esc(translateIpType(n.ip_type))}</td>
         <td class="col-actions">
