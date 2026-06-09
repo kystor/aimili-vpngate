@@ -3469,13 +3469,13 @@ INDEX_HTML = r"""<!doctype html>
       width: 100%;
       border-collapse: collapse;
       text-align: left;
-      min-width: 1500px;
+      min-width: 1220px;
       table-layout: fixed;
     }
 
     .nodes-table th,
     .nodes-table td {
-      padding: 14px 20px;
+      padding: 12px 14px;
       border-bottom: 1px solid var(--border-color);
       font-size: 14px;
       vertical-align: middle;
@@ -3493,16 +3493,16 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-secondary);
     }
 
-    .nodes-table .col-status { width: 110px; }
-    .nodes-table .col-latency { width: 92px; }
-    .nodes-table .col-address { width: 220px; }
-    .nodes-table .col-location { width: 230px; }
-    .nodes-table .col-asn { width: 190px; }
-    .nodes-table .col-owner { width: 230px; }
-    .nodes-table .col-proto { width: 90px; text-align: center; }
-    .nodes-table .col-quality { width: 110px; }
-    .nodes-table .col-ip-type { width: 110px; }
-    .nodes-table .col-actions { width: 170px; }
+    .nodes-table .col-status { width: 88px; }
+    .nodes-table .col-latency { width: 72px; }
+    .nodes-table .col-address { width: 170px; }
+    .nodes-table .col-location { width: 168px; }
+    .nodes-table .col-asn { width: 150px; }
+    .nodes-table .col-owner { width: 170px; }
+    .nodes-table .col-proto { width: 74px; text-align: center; }
+    .nodes-table .col-quality { width: 90px; }
+    .nodes-table .col-ip-type { width: 86px; }
+    .nodes-table .col-actions { width: 136px; }
 
     .nodes-table tr {
       transition: background 0.2s ease;
