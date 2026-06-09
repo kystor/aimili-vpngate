@@ -3493,8 +3493,8 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-secondary);
     }
 
-    .nodes-table .col-status { width: 88px; }
-    .nodes-table .col-latency { width: 72px; }
+    .nodes-table .col-status { width: 72px; }
+    .nodes-table .col-latency { width: 64px; }
     .nodes-table .col-address { width: 165px; }
     .nodes-table .col-proto { width: 70px; text-align: center; }
     .nodes-table .col-location { width: 148px; }
