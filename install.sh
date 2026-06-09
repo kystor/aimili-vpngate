@@ -201,6 +201,8 @@ else
 fi
 
 echo -e "  -> 正在写入服务环境文件 /etc/default/aimilivpn ..."
+# 【优化】：提前创建目录，彻底解决 Alpine 下 No such file or directory 的报错
+mkdir -p /etc/default
 cat > /etc/default/aimilivpn <<EOF
 # AimiliVPN 服务默认环境变量
 VPNGATE_DATA_DIR=${INSTALL_DIR}/vpngate_data
