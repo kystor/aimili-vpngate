@@ -3489,16 +3489,16 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-secondary);
     }
 
-    .nodes-table .col-status { width: 60px; }
-    .nodes-table .col-latency { width: 50px; }
-    .nodes-table .col-address { width: 165px; }
+    .nodes-table .col-status { width: 60px; text-align: center; }
+    .nodes-table .col-latency { width: 50px; text-align: center; }
+    .nodes-table .col-address { width: 165px; text-align: center; }
     .nodes-table .col-proto { width: 70px; text-align: center; }
-    .nodes-table .col-location { width: 140px; }
-    .nodes-table .col-asn { width: 140px; }
-    .nodes-table .col-owner { width: 140px; }
-    .nodes-table .col-quality { width: 65px; }
-    .nodes-table .col-ip-type { width: 55px; }
-    .nodes-table .col-actions { width: 122px; }
+    .nodes-table .col-location { width: 140px; text-align: center; }
+    .nodes-table .col-asn { width: 140px; text-align: center; }
+    .nodes-table .col-owner { width: 140px; text-align: center; }
+    .nodes-table .col-quality { width: 65px; text-align: center; }
+    .nodes-table .col-ip-type { width: 55px; text-align: center; }
+    .nodes-table .col-actions { width: 122px; text-align: center; }
 
     .nodes-table tr {
       transition: background 0.2s ease;
