@@ -3502,15 +3502,15 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-secondary);
     }
 
-    .nodes-table .col-status { width: 72px; }
+    .nodes-table .col-status { width: 65px; }
     .nodes-table .col-latency { width: 64px; }
     .nodes-table .col-address { width: 165px; }
     .nodes-table .col-proto { width: 70px; text-align: center; }
     .nodes-table .col-location { width: 148px; }
-    .nodes-table .col-asn { width: 150px; }
-    .nodes-table .col-owner { width: 150px; }
-    .nodes-table .col-quality { width: 78px; }
-    .nodes-table .col-ip-type { width: 74px; }
+    .nodes-table .col-asn { width: 140px; }
+    .nodes-table .col-owner { width: 140px; }
+    .nodes-table .col-quality { width: 70px; }
+    .nodes-table .col-ip-type { width: 65px; }
     .nodes-table .col-actions { width: 122px; }
 
     .nodes-table tr {
