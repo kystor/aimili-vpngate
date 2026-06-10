@@ -3489,16 +3489,16 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-secondary);
     }
 
-    .nodes-table .col-status { width: 60px; text-align: center; }
-    .nodes-table .col-latency { width: 50px; text-align: center; }
-    .nodes-table .col-address { width: 165px; text-align: center; }
+    .nodes-table .col-status { width: 65px; }
+    .nodes-table .col-latency { width: 64px; }
+    .nodes-table .col-address { width: 165px; }
     .nodes-table .col-proto { width: 70px; text-align: center; }
-    .nodes-table .col-location { width: 140px; text-align: center; }
-    .nodes-table .col-asn { width: 140px; text-align: center; }
-    .nodes-table .col-owner { width: 140px; text-align: center; }
-    .nodes-table .col-quality { width: 65px; text-align: center; }
-    .nodes-table .col-ip-type { width: 55px; text-align: center; }
-    .nodes-table .col-actions { width: 122px; text-align: center; }
+    .nodes-table .col-location { width: 148px; }
+    .nodes-table .col-asn { width: 140px; }
+    .nodes-table .col-owner { width: 140px; }
+    .nodes-table .col-quality { width: 70px; }
+    .nodes-table .col-ip-type { width: 65px; }
+    .nodes-table .col-actions { width: 122px; }
 
     .nodes-table tr {
       transition: background 0.2s ease;
@@ -4776,9 +4776,11 @@ function render(){
   const activeNodeId = state.active_openvpn_node_id;
   const activeNode = nodes.find(n => n && (n.active || n.id === activeNodeId));
   
-  // Render separated Active Node Card
+  // 当前节点状态框优先跟随更及时的连接中状态，避免切换节点时仍显示旧节点已连接
   const activeCardContainer = $("active_node_card");
-  if (state.is_connecting && !activeNode) {
+  if (state.is_connecting) {
+    const connectingTitle = state.active_node_latency || "正在连接...";
+    const connectingMessage = state.last_check_message || "正在与 VPN 节点建立加密隧道，请稍候...";
     activeCardContainer.innerHTML = `
       <div class="active-card" style="background: var(--bg-surface); border-color: var(--warning); box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);">
         <div class="active-card-info">
@@ -4788,10 +4790,10 @@ function render(){
           <div class="active-card-details">
             <div class="active-card-title" style="color: var(--text-primary);">
               <span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);"><span class="badge-pulse" style="background: #f59e0b;"></span>正在连接</span>
-              <strong>${esc(state.active_node_latency || '正在连接...')}</strong>
+              <strong>${esc(connectingTitle)}</strong>
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
-              ${esc(state.last_check_message || '正在与 VPN 节点建立加密隧道，请稍候...')}
+              ${esc(connectingMessage)}
             </div>
           </div>
         </div>
