@@ -4660,6 +4660,11 @@ function formatProtoLabel(proto) {
   return "-";
 }
 
+function getAllowedRoutingProtocols() {
+  const protocols = Array.isArray(state?.routing_protocol) ? state.routing_protocol : [];
+  return protocols.filter(Boolean);
+}
+
 function setProtocolToggleState(button, enabled) {
   if (!button) return;
   button.classList.toggle("active", !!enabled);
@@ -4939,9 +4944,14 @@ function render(){
       
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       const isUnavailable = n.probe_status === "unavailable";
+      const allowedProtocols = getAllowedRoutingProtocols();
+      const isProtocolBlocked = protoClass && allowedProtocols.length > 0 && !allowedProtocols.includes(protoClass);
+      const blockedTitle = isProtocolBlocked ? `当前协议偏好未包含 ${protoText}，请先勾选页面顶部 ${protoText}` : "";
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+        : isProtocolBlocked
+          ? `<span title="${esc(blockedTitle)}" style="display:inline-block;"><button class="connect-btn" disabled style="opacity:0.3; cursor:not-allowed;">切换</button></span>`
+          : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
       return `<tr ${rowClass}>
         <td class="col-status"><span class="badge ${badgeClass}">${badgeText}</span></td>
