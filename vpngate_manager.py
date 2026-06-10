@@ -6449,8 +6449,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_json_with_headers(
+        self,
+        data: Any,
+        status: HTTPStatus = HTTPStatus.OK,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-        self.send_bytes(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
+        self.send_json_with_headers(data, status)
 
     def do_GET(self) -> None:
         effective_path = self.validate_path()
@@ -6649,13 +6666,13 @@ class Handler(BaseHTTPRequestHandler):
                     token = uuid.uuid4().hex
                     with lock:
                         active_sessions[token] = time.time() + 30 * 24 * 3600
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
                     secret_path = self.get_secret_path()
                     cookie_path = f"/{secret_path}/" if secret_path else "/"
-                    self.send_header("Set-Cookie", f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+                    self.send_json_with_headers(
+                        {"ok": True},
+                        HTTPStatus.OK,
+                        {"Set-Cookie": f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000"},
+                    )
                 else:
                     self.send_json({"ok": False, "error": "用户名或密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
             except Exception as exc:
@@ -6678,11 +6695,11 @@ class Handler(BaseHTTPRequestHandler):
                         active_sessions.pop(session_token, None)
                 secret_path = self.get_secret_path()
                 cookie_path = f"/{secret_path}/" if secret_path else "/"
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Set-Cookie", f"session=; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+                self.send_json_with_headers(
+                    {"ok": True},
+                    HTTPStatus.OK,
+                    {"Set-Cookie": f"session=; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"},
+                )
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
