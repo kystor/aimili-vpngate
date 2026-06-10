@@ -128,7 +128,6 @@ active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
 is_connecting = True
-is_vpn_switching = False
 proxy_health_failures = 0
 last_active_ping_time = 0.0
 last_active_latency = 0
@@ -393,11 +392,10 @@ def set_state(**updates: Any) -> None:
 
 
 def get_state() -> dict[str, Any]:
-    global active_openvpn_node_id, is_connecting, is_vpn_switching
+    global active_openvpn_node_id, is_connecting
     state = read_json(STATE_FILE, {})
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
-    state["is_vpn_switching"] = is_vpn_switching
     state.setdefault("api_url", API_URL)
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
@@ -2058,13 +2056,11 @@ def auto_switch_node(attempt: int = 0) -> None:
         auto_switch_node(attempt + 1)
 
 def connect_node(node_id: str) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting, is_vpn_switching, proxy_health_failures
+    global active_openvpn_process, active_openvpn_node_id, is_connecting, proxy_health_failures
     acquired_heavy_lock = False
-    previous_active_node_id = ""
     with lock:
         if is_connecting:
             return "已有连接任务正在执行"
-        previous_active_node_id = active_openvpn_node_id
         is_connecting = True
 
     try:
@@ -2087,15 +2083,10 @@ def connect_node(node_id: str) -> str:
         DATA_DIR.mkdir(exist_ok=True, parents=True)
         auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        with lock:
-            is_vpn_switching = True
-        set_state(
-            active_openvpn_node_id=previous_active_node_id,
-            is_connecting=True,
-            is_vpn_switching=True,
-            active_node_latency="清理旧连接",
-            last_check_message="正在关闭旧连接",
-        )
+        for item in nodes:
+            item["active"] = False
+        write_json(NODES_FILE, nodes)
+        set_state(active_node_latency="清理旧连接", last_check_message="正在关闭旧连接")
         stop_active_openvpn()
 
         set_state(active_node_latency="准备配置", last_check_message="正在准备 OpenVPN 配置")
@@ -2113,13 +2104,11 @@ def connect_node(node_id: str) -> str:
             set_state(
                 active_openvpn_node_id="",
                 is_connecting=False,
-                is_vpn_switching=False,
                 active_node_latency="连接失败",
                 last_check_message=f"节点连接失败: {message}",
             )
             with lock:
                 active_openvpn_node_id = ""
-                is_vpn_switching = False
             raise RuntimeError(message)
 
         with lock:
@@ -2174,7 +2163,6 @@ def connect_node(node_id: str) -> str:
         set_state(
             active_openvpn_node_id=node_id,
             is_connecting=False,
-            is_vpn_switching=False,
             active_node_latency=latency_text,
             last_check_message=f"节点 {node_id} 已连接",
         )
@@ -2186,7 +2174,6 @@ def connect_node(node_id: str) -> str:
             heavy_task_lock.release()
         with lock:
             is_connecting = False
-            is_vpn_switching = False
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global is_connecting
@@ -4486,7 +4473,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </main>
 <script>
-let nodes=[], state={}, testingNodeIds = new Set(), pendingConnectNodeIds = new Set();
+let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
 const pageSize = 15;
 let currentPageNodes = [];
@@ -4680,7 +4667,7 @@ function setProtocolToggleState(button, enabled) {
 }
 
 function getNodeSyncPaused() {
-  return Boolean(state?.is_connecting) || Boolean(state?.is_vpn_switching) || Boolean(testingNodeIds?.size) || Boolean(pendingConnectNodeIds?.size);
+  return Boolean(state?.is_connecting) || Boolean(testingNodeIds?.size);
 }
 
 async function syncNodes(options = {}) {
@@ -4786,7 +4773,7 @@ function render(){
   
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
-  if (state.is_vpn_switching && !activeNode) {
+  if (state.is_connecting && !activeNode) {
     activeCardContainer.innerHTML = `
       <div class="active-card" style="background: var(--bg-surface); border-color: var(--warning); box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);">
         <div class="active-card-info">
@@ -4876,7 +4863,7 @@ function render(){
   const pLatVal = $("proxy_latency_val");
   const pBtn = $("btn_test_proxy");
   
-  if (state.is_vpn_switching) {
+  if (state.is_connecting) {
     pBadge.className = "badge";
     pBadge.style.background = "rgba(245, 158, 11, 0.15)";
     pBadge.style.color = "#f59e0b";
@@ -4952,12 +4939,9 @@ function render(){
       
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       const isUnavailable = n.probe_status === "unavailable";
-      const isPendingConnect = pendingConnectNodeIds.has(n.id);
-      const connectSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
-      const connectBtnText = isPendingConnect ? `${connectSpinner}处理中` : '切换';
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${(isUnavailable || state.is_connecting || isPendingConnect) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">${connectBtnText}</button>`;
+        : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
       return `<tr ${rowClass}>
         <td class="col-status"><span class="badge ${badgeClass}">${badgeText}</span></td>
@@ -5057,13 +5041,10 @@ function startConnectionPolling() {
       pollInterval = null;
       load();
     }
-  }, 1000);
+  }, 300);
 }
 
 async function connectNode(id){
-  pendingConnectNodeIds.add(id);
-  render();
-
   try {
     const r = await fetch("./api/connect",{
       method:"POST",
@@ -5073,24 +5054,30 @@ async function connectNode(id){
     const result = await r.json();
     if (!result.ok) {
       alert("连接失败: " + (result.error || "未知错误"));
-      pendingConnectNodeIds.delete(id);
+        if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
       await syncNodes();
       render();
       return;
     }
-    pendingConnectNodeIds.delete(id);
-    await syncNodes();
-    if (state.is_vpn_switching) {
-      startConnectionPolling();
-    } else {
-      render();
-    }
   } catch(e) {
-    pendingConnectNodeIds.delete(id);
     alert("连接请求错误");
+    if (pollInterval) {
+      clearInterval(pollInterval);
+      pollInterval = null;
+    }
     await syncNodes().catch(() => {});
     render();
+    return;
   }
+
+  startConnectionPolling();
+  try {
+    await syncNodes();
+  } catch(e) {}
+  render();
 }
 
 async function disconnectNode(){
