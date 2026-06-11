@@ -23,6 +23,7 @@ import concurrent.futures
 import sys
 import uuid
 
+# 启动阶段优先整理基础网络解析行为
 # Prefer IPv4 resolution to avoid slow AAAA DNS timeouts (e.g. in WSL),
 # but fall back to system default (IPv6) if IPv4 resolution fails.
 # This ensures pure-IPv6 VPS (with NAT64/clatd) can still function.
@@ -1880,10 +1881,9 @@ def run_node_test_batches(node_ids: list[str], batch_size: int, skip_active: boo
 
         if skip_active:
             with lock:
-                current_nodes = read_json(NODES_FILE, [])
                 active_ids = {
                     str(node.get("id") or "")
-                    for node in current_nodes
+                    for node in read_json(NODES_FILE, [])
                     if node.get("active")
                 }
             current_batch = [node_id for node_id in current_batch if node_id not in active_ids]
@@ -1899,34 +1899,95 @@ def run_node_test_batches(node_ids: list[str], batch_size: int, skip_active: boo
 
     return all_results
 
+def select_node_ids_for_testing(
+    nodes: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    probe_statuses: set[str] | None = None,
+    exclude_active: bool = True,
+    routed_only: bool = False,
+    ui_cfg: dict[str, Any] | None = None,
+) -> list[str]:
+    source_nodes = filter_nodes_for_routing(nodes, ui_cfg) if routed_only and ui_cfg else nodes
+    selected_ids: list[str] = []
+    for node in source_nodes:
+        node_id = str(node.get("id") or "")
+        if not node_id:
+            continue
+        if exclude_active and node.get("active"):
+            continue
+        if probe_statuses is not None and str(node.get("probe_status") or "") not in probe_statuses:
+            continue
+        selected_ids.append(node_id)
+        if limit is not None and len(selected_ids) >= limit:
+            break
+    return selected_ids
+
+def run_background_node_test_job(
+    *,
+    job_lock: threading.Lock,
+    task_name: str,
+    select_ids: Callable[[], list[str]],
+    batch_size: int,
+    skip_active: bool = False,
+    on_queued: Callable[[], None] | None = None,
+    on_started: Callable[[float], None] | None = None,
+    on_empty: Callable[[float], None] | None = None,
+    on_success: Callable[[list[str], float], None] | None = None,
+    on_error: Callable[[Exception, float], None] | None = None,
+    on_finished: Callable[[], None] | None = None,
+) -> bool:
+    if not job_lock.acquire(blocking=False):
+        return False
+    if on_queued:
+        on_queued()
+
+    def worker() -> None:
+        acquired_heavy_lock = False
+        try:
+            started_at = time.time()
+            if on_started:
+                on_started(started_at)
+            heavy_task_lock.acquire()
+            acquired_heavy_lock = True
+            node_ids = select_ids()
+            if not node_ids:
+                if on_empty:
+                    on_empty(time.time())
+                return
+            run_node_test_batches(node_ids, batch_size, skip_active=skip_active)
+            if on_success:
+                on_success(node_ids, time.time())
+        except Exception as exc:
+            finished_at = time.time()
+            print(f"[{task_name}] 后台任务失败: {exc}", flush=True)
+            log_to_json("WARNING", "Main", f"{task_name}失败: {exc}")
+            if on_error:
+                on_error(exc, finished_at)
+        finally:
+            if acquired_heavy_lock:
+                heavy_task_lock.release()
+            if on_finished:
+                on_finished()
+            job_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
 def schedule_followup_tests(limit: int | None = None) -> None:
     max_nodes = limit if limit is not None else FOLLOWUP_TEST_BATCH_SIZE
     if max_nodes <= 0:
         return
-    if not followup_test_lock.acquire(blocking=False):
-        return
-
-    def worker() -> None:
-        try:
-            heavy_task_lock.acquire()
-            with lock:
-                nodes = read_json(NODES_FILE, [])
-                node_ids = [
-                    str(node.get("id") or "")
-                    for node in nodes
-                    if not node.get("active") and node.get("probe_status") == "not_checked"
-                ][:max_nodes]
-            if not node_ids:
-                return
-            run_node_test_batches(node_ids, max_nodes)
-        except Exception as exc:
-            print(f"[后台续测] 检测待检测节点失败: {exc}", flush=True)
-            log_to_json("WARNING", "Main", f"后台续测失败: {exc}")
-        finally:
-            heavy_task_lock.release()
-            followup_test_lock.release()
-
-    threading.Thread(target=worker, daemon=True).start()
+    run_background_node_test_job(
+        job_lock=followup_test_lock,
+        task_name="后台续测",
+        select_ids=lambda: select_node_ids_for_testing(
+            read_json(NODES_FILE, []),
+            limit=max_nodes,
+            probe_statuses={"not_checked"},
+        ),
+        batch_size=max_nodes,
+    )
 
 def schedule_available_recheck(reason: str = "周期复检到期") -> bool:
     global available_recheck_pending
@@ -1934,65 +1995,49 @@ def schedule_available_recheck(reason: str = "周期复检到期") -> bool:
         if available_recheck_pending or available_recheck_lock.locked():
             return False
         available_recheck_pending = True
-    set_state(available_recheck_pending=True, available_recheck_message=f"{reason}，已加入后台队列")
 
-    def worker() -> None:
+    def finish_pending_flag() -> None:
         global available_recheck_pending
-        with available_recheck_lock:
-            started_at = time.time()
-            acquired_heavy_lock = False
-            try:
-                set_state(
-                    available_recheck_running=True,
-                    available_recheck_pending=False,
-                    last_available_recheck_started_at=started_at,
-                    available_recheck_message="正在后台周期复检全部可用节点",
-                )
-                heavy_task_lock.acquire()
-                acquired_heavy_lock = True
-                with lock:
-                    current_nodes = read_json(NODES_FILE, [])
-                    node_ids = [
-                        str(node.get("id") or "")
-                        for node in current_nodes
-                        if node.get("probe_status") == "available" and not node.get("active")
-                    ]
-                if not node_ids:
-                    completed_at = time.time()
-                    set_state(
-                        available_recheck_running=False,
-                        last_available_recheck_completed_at=completed_at,
-                        available_recheck_message="当前没有可供周期复检的可用节点",
-                    )
-                    return
+        with lock:
+            available_recheck_pending = False
+        set_state(available_recheck_pending=False)
 
-                run_node_test_batches(node_ids, MAX_BATCH_TEST_REQUEST_SIZE, skip_active=True)
-
-                completed_at = time.time()
-                set_state(
-                    available_recheck_running=False,
-                    last_available_recheck_completed_at=completed_at,
-                    available_recheck_message=f"周期复检完成，本轮共检测 {len(node_ids)} 个可用节点",
-                )
-                log_to_json("INFO", "Main", f"周期复检完成，共检测 {len(node_ids)} 个可用节点")
-            except Exception as exc:
-                completed_at = time.time()
-                print(f"[周期复检] 后台任务失败: {exc}", flush=True)
-                log_to_json("WARNING", "Main", f"周期复检失败: {exc}")
-                set_state(
-                    available_recheck_running=False,
-                    last_available_recheck_completed_at=completed_at,
-                    available_recheck_message=f"周期复检失败: {exc}",
-                )
-            finally:
-                with lock:
-                    available_recheck_pending = False
-                set_state(available_recheck_pending=False)
-                if acquired_heavy_lock:
-                    heavy_task_lock.release()
-
-    threading.Thread(target=worker, daemon=True).start()
-    return True
+    return run_background_node_test_job(
+        job_lock=available_recheck_lock,
+        task_name="周期复检",
+        select_ids=lambda: select_node_ids_for_testing(
+            read_json(NODES_FILE, []),
+            probe_statuses={"available"},
+        ),
+        batch_size=MAX_BATCH_TEST_REQUEST_SIZE,
+        skip_active=True,
+        on_queued=lambda: set_state(available_recheck_pending=True, available_recheck_message=f"{reason}，已加入后台队列"),
+        on_started=lambda started_at: set_state(
+            available_recheck_running=True,
+            available_recheck_pending=False,
+            last_available_recheck_started_at=started_at,
+            available_recheck_message="正在后台周期复检全部可用节点",
+        ),
+        on_empty=lambda completed_at: set_state(
+            available_recheck_running=False,
+            last_available_recheck_completed_at=completed_at,
+            available_recheck_message="当前没有可供周期复检的可用节点",
+        ),
+        on_success=lambda node_ids, completed_at: (
+            set_state(
+                available_recheck_running=False,
+                last_available_recheck_completed_at=completed_at,
+                available_recheck_message=f"周期复检完成，本轮共检测 {len(node_ids)} 个可用节点",
+            ),
+            log_to_json("INFO", "Main", f"周期复检完成，共检测 {len(node_ids)} 个可用节点"),
+        ),
+        on_error=lambda exc, completed_at: set_state(
+            available_recheck_running=False,
+            last_available_recheck_completed_at=completed_at,
+            available_recheck_message=f"周期复检失败: {exc}",
+        ),
+        on_finished=finish_pending_flag,
+    )
 
 def start_system_update() -> tuple[bool, str]:
     if not system_update_lock.acquire(blocking=False):
@@ -2265,11 +2310,12 @@ def maintain_valid_nodes(force: bool = False) -> str:
         merged_nodes = sort_all_nodes(merged_nodes)[:MAX_CACHED_NODES]
         write_json(NODES_FILE, merged_nodes)
 
-        to_test = [
-            node["id"]
-            for node in merged_nodes
-            if not node.get("active") and node.get("probe_status") != "available"
-        ][:MAX_MAINTAIN_TEST_NODES]
+        to_test = select_node_ids_for_testing(
+            merged_nodes,
+            limit=MAX_MAINTAIN_TEST_NODES,
+            exclude_active=True,
+            probe_statuses={"not_checked", "unavailable", "error", ""},
+        )
 
         if to_test:
             set_state(is_connecting=True, last_check_message=f"正在检测 {len(to_test)} 个节点")
@@ -2394,11 +2440,13 @@ def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> st
         write_json(NODES_FILE, merged_nodes)
 
         ui_cfg = load_ui_config()
-        pending_ids = [
-            str(node.get("id") or "")
-            for node in filter_nodes_for_routing(merged_nodes, ui_cfg)
-            if not node.get("active") and node.get("probe_status") != "available"
-        ]
+        pending_ids = select_node_ids_for_testing(
+            merged_nodes,
+            exclude_active=True,
+            routed_only=True,
+            ui_cfg=ui_cfg,
+            probe_statuses={"not_checked", "unavailable", "error", ""},
+        )
 
         while pending_ids:
             current_nodes = read_json(NODES_FILE, [])
@@ -7156,4 +7204,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
 
