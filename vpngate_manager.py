@@ -4412,7 +4412,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
-  <div id="page_toast" style="position: fixed; top: 28px; left: 50%; transform: translateX(-50%) translateY(-12px); min-width: 220px; max-width: min(520px, calc(100vw - 32px)); padding: 12px 18px; border-radius: 10px; background: rgba(15, 23, 42, 0.96); color: #f8fafc; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 16px 40px rgba(0,0,0,0.35); font-size: 14px; line-height: 1.4; text-align: center; z-index: 9999; opacity: 0; pointer-events: none; transition: opacity .18s ease, transform .18s ease; backdrop-filter: blur(10px);"></div>
+  <div id="page_toast" style="position: fixed; top: 28px; left: 50%; transform: translateX(-50%) translateY(-12px); min-width: 220px; max-width: min(520px, calc(100vw - 32px)); padding: 12px 18px; border-radius: 10px; background: rgba(15, 23, 42, 0.96); color: #f8fafc; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 16px 40px rgba(0,0,0,0.35); font-size: 14px; line-height: 1.4; text-align: center; z-index: 20000; opacity: 0; pointer-events: none; transition: opacity .18s ease, transform .18s ease; backdrop-filter: blur(10px);"></div>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
