@@ -1865,6 +1865,40 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     set_state(last_check_at=time.time(), valid_nodes=valid_nodes)
     return [results_map[node_id] for node_id in node_ids if node_id in results_map]
 
+def run_node_test_batches(node_ids: list[str], batch_size: int, skip_active: bool = False) -> list[dict[str, Any]]:
+    normalized_ids = [str(node_id or "") for node_id in node_ids if str(node_id or "")]
+    if not normalized_ids:
+        return []
+
+    effective_batch_size = max(1, batch_size)
+    all_results: list[dict[str, Any]] = []
+    pending_ids = list(normalized_ids)
+
+    while pending_ids:
+        current_batch = pending_ids[:effective_batch_size]
+        pending_ids = pending_ids[effective_batch_size:]
+
+        if skip_active:
+            with lock:
+                current_nodes = read_json(NODES_FILE, [])
+                active_ids = {
+                    str(node.get("id") or "")
+                    for node in current_nodes
+                    if node.get("active")
+                }
+            current_batch = [node_id for node_id in current_batch if node_id not in active_ids]
+
+        if not current_batch:
+            continue
+
+        set_node_testing_state(current_batch, True)
+        try:
+            all_results.extend(test_multiple_nodes(current_batch))
+        finally:
+            set_node_testing_state(current_batch, False)
+
+    return all_results
+
 def schedule_followup_tests(limit: int | None = None) -> None:
     max_nodes = limit if limit is not None else FOLLOWUP_TEST_BATCH_SIZE
     if max_nodes <= 0:
@@ -1884,11 +1918,7 @@ def schedule_followup_tests(limit: int | None = None) -> None:
                 ][:max_nodes]
             if not node_ids:
                 return
-            set_node_testing_state(node_ids, True)
-            try:
-                test_multiple_nodes(node_ids)
-            finally:
-                set_node_testing_state(node_ids, False)
+            run_node_test_batches(node_ids, max_nodes)
         except Exception as exc:
             print(f"[后台续测] 检测待检测节点失败: {exc}", flush=True)
             log_to_json("WARNING", "Main", f"后台续测失败: {exc}")
@@ -1922,7 +1952,11 @@ def schedule_available_recheck(reason: str = "周期复检到期") -> bool:
                 acquired_heavy_lock = True
                 with lock:
                     current_nodes = read_json(NODES_FILE, [])
-                    node_ids = [str(node.get("id") or "") for node in current_nodes if node.get("probe_status") == "available"]
+                    node_ids = [
+                        str(node.get("id") or "")
+                        for node in current_nodes
+                        if node.get("probe_status") == "available" and not node.get("active")
+                    ]
                 if not node_ids:
                     completed_at = time.time()
                     set_state(
@@ -1932,11 +1966,7 @@ def schedule_available_recheck(reason: str = "周期复检到期") -> bool:
                     )
                     return
 
-                set_node_testing_state(node_ids, True)
-                try:
-                    test_multiple_nodes(node_ids)
-                finally:
-                    set_node_testing_state(node_ids, False)
+                run_node_test_batches(node_ids, MAX_BATCH_TEST_REQUEST_SIZE, skip_active=True)
 
                 completed_at = time.time()
                 set_state(
@@ -7126,3 +7156,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
