@@ -5987,11 +5987,84 @@ function renderGatewayServices(services) {
 
 let logsPollInterval = null;
 let rawLogsCache = [];
+let filteredLogsCache = [];
+let logsInteractionPausedUntil = 0;
+let logTerminalEventsBound = false;
+
+function getFilteredLogs() {
+  const filterVal = $("log_filter_select").value;
+  if (filterVal === "proxy") {
+    return rawLogsCache.filter(l => l.module === "Proxy");
+  }
+  if (filterVal === "vpn") {
+    return rawLogsCache.filter(l => l.module === "VPN");
+  }
+  if (filterVal === "system") {
+    return rawLogsCache.filter(l => !["Proxy", "VPN"].includes(l.module));
+  }
+  return rawLogsCache.slice();
+}
+
+function getLogLineColor(logItem) {
+  if (logItem.level === "ERROR") return "#f43f5e";
+  if (logItem.level === "WARNING") return "#fbbf24";
+  if (logItem.module === "Proxy") return "#38bdf8";
+  if (logItem.module === "VPN") return "#34d399";
+  return "#a5b4fc";
+}
+
+function formatLogLine(logItem) {
+  return `[${logItem.timestamp || ""}] [${logItem.level || ""}] [${logItem.module || ""}] ${logItem.message || ""}`;
+}
+
+function pauseLogsRefresh(milliseconds = 10000) {
+  logsInteractionPausedUntil = Math.max(logsInteractionPausedUntil, Date.now() + milliseconds);
+}
+
+function hasLogTextSelection() {
+  const term = $("log_terminal_container");
+  const selection = window.getSelection();
+  if (!term || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return false;
+  }
+  const range = selection.getRangeAt(0);
+  return term.contains(range.commonAncestorContainer);
+}
+
+function shouldPauseLogsRefresh() {
+  return Date.now() < logsInteractionPausedUntil || hasLogTextSelection();
+}
+
+function bindLogTerminalEvents() {
+  if (logTerminalEventsBound) return;
+  const term = $("log_terminal_container");
+  if (!term) return;
+
+  const pauseForSelection = () => pauseLogsRefresh(15000);
+  term.addEventListener("mousedown", pauseForSelection);
+  term.addEventListener("touchstart", pauseForSelection, { passive: true });
+  term.addEventListener("copy", () => pauseLogsRefresh(3000));
+  document.addEventListener("selectionchange", () => {
+    if ($("logs_modal").style.display !== "flex") return;
+    if (hasLogTextSelection()) {
+      pauseLogsRefresh(15000);
+    }
+  });
+  logTerminalEventsBound = true;
+}
+
+function getRenderedLogText() {
+  const logs = getFilteredLogs();
+  filteredLogsCache = logs;
+  return logs.map(formatLogLine).join("\n").trim();
+}
 
 function openLogsModal() {
   $("admin_dropdown").style.display = "none";
   $("logs_modal").style.display = "flex";
-  loadLogs();
+  bindLogTerminalEvents();
+  logsInteractionPausedUntil = 0;
+  loadLogs(true);
   if (logsPollInterval) clearInterval(logsPollInterval);
   logsPollInterval = setInterval(loadLogs, 2500);
 }
@@ -6004,86 +6077,95 @@ function closeLogsModal() {
   }
 }
 
-async function loadLogs() {
+async function loadLogs(forceRender = false) {
   try {
     const res = await fetch("./api/logs");
     const data = await res.json();
     if (data.logs) {
       rawLogsCache = data.logs;
-      filterAndRenderLogs();
+      if (forceRender || !shouldPauseLogsRefresh()) {
+        filterAndRenderLogs(forceRender);
+      }
     }
   } catch (e) {
     console.error("加载日志失败", e);
   }
 }
 
-function filterAndRenderLogs() {
-  const filterVal = $("log_filter_select").value;
+function filterAndRenderLogs(forceRender = false) {
   const term = $("log_terminal_container");
   if (!term) return;
-  
-  let filtered = rawLogsCache;
-  if (filterVal === "proxy") {
-    filtered = rawLogsCache.filter(l => l.module === "Proxy");
-  } else if (filterVal === "vpn") {
-    filtered = rawLogsCache.filter(l => l.module === "VPN");
-  } else if (filterVal === "system") {
-    filtered = rawLogsCache.filter(l => !["Proxy", "VPN"].includes(l.module));
+
+  if (!forceRender && shouldPauseLogsRefresh()) {
+    return;
   }
-  
-  if (filtered.length === 0) {
+
+  filteredLogsCache = getFilteredLogs();
+  if (filteredLogsCache.length === 0) {
     term.innerHTML = `<div style="color: var(--text-secondary); text-align: center; margin-top: 150px;">暂无该类型日志。</div>`;
     return;
   }
-  
-  const linesHtml = filtered.map(l => {
-    let color = "#a5b4fc";
-    if (l.module === "Proxy") color = "#38bdf8";
-    if (l.module === "VPN") color = "#34d399";
-    if (l.level === "WARNING") color = "#fbbf24";
-    if (l.level === "ERROR") color = "#f43f5e";
-    
-    return `<div style="color: ${color}; margin-bottom: 4px;">[${esc(l.timestamp)}] [${esc(l.level)}] [${esc(l.module)}] ${esc(l.message)}</div>`;
+
+  const linesHtml = filteredLogsCache.map(l => {
+    const color = getLogLineColor(l);
+    return `<div style="color: ${color}; margin-bottom: 4px;">${esc(formatLogLine(l))}</div>`;
   }).join("");
-  
+
   const isAtBottom = term.scrollHeight - term.clientHeight <= term.scrollTop + 50;
-  
   term.innerHTML = linesHtml;
-  
+
   if (isAtBottom) {
     term.scrollTop = term.scrollHeight;
   }
 }
 
-function copyLogContent() {
-  const term = $("log_terminal_container");
-  if (!term) return;
-  
-  const text = term.innerText || term.textContent;
+async function copyLogContent() {
+  const text = getRenderedLogText();
   if (!text || text.includes("暂无今日") || text.includes("暂无该类型")) {
     alert("当前没有可供复制的日志。");
     return;
   }
-  
-  navigator.clipboard.writeText(text).then(() => {
-    alert("日志内容已成功复制到剪贴板！");
-  }).catch(err => {
-    console.error("复制失败", err);
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
+
+  pauseLogsRefresh(3000);
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      alert("日志内容已成功复制到剪贴板！");
+      return;
+    }
+  } catch (err) {
+    console.error("现代剪贴板复制失败，准备回退旧方案", err);
+  }
+
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "readonly");
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  ta.style.top = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (err) {
+    console.error("旧版剪贴板复制失败", err);
+  } finally {
     document.body.removeChild(ta);
-    alert("日志内容已复制到剪贴板！");
-  });
+  }
+
+  if (copied) {
+    alert("日志内容已成功复制到剪贴板！");
+  } else {
+    alert("复制失败，请手动选中日志后按 Ctrl+C。");
+  }
 }
 
 function exportLogContent() {
-  const term = $("log_terminal_container");
-  if (!term) return;
-  
-  const text = term.innerText || term.textContent;
+  const text = getRenderedLogText();
   if (!text || text.includes("暂无今日") || text.includes("暂无该类型")) {
     alert("当前没有可供导出的日志。");
     return;
