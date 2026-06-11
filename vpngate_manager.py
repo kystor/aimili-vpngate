@@ -1313,14 +1313,19 @@ def fetch_candidates() -> list[dict[str, Any]]:
             raise last_error
         raise RuntimeError("未获取到任何节点数据")
 
-    log_to_json("INFO", "Main", f"开始抓取节点，共 {len(source_urls)} 个来源")
+    start_message = f"开始抓取节点，共 {len(source_urls)} 个来源"
+    print(f"[抓取节点] {start_message}", flush=True)
+    log_to_json("INFO", "Main", start_message)
     for index, source_url in enumerate(source_urls, start=1):
         try:
             rows, actual_url = fetch_rows_from_source(source_url, 1 if has_cache or index > 1 else 2)
             update_source_runtime_result(actual_url, True, "", 200)
         except Exception as exc:
             update_source_runtime_result(source_url, False, str(exc), parse_http_code_from_error(exc))
-            source_summaries.append(f"来源{index}失败")
+            failure_message = f"来源{index}抓取失败: {source_url} -> {exc}"
+            print(f"[抓取节点] {failure_message}", flush=True)
+            log_to_json("WARNING", "Main", failure_message)
+            source_summaries.append(f"来源{index}抓取失败")
             continue
 
         added = 0
@@ -1339,7 +1344,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
             seen_endpoints.add(endpoint_key)
             candidates.append(node)
             added += 1
-        source_summaries.append(f"来源{index}+{added}")
+        source_summaries.append(f"来源{index}抓取到 {added} 个")
 
     if not candidates:
         err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
@@ -1350,10 +1355,14 @@ def fetch_candidates() -> list[dict[str, Any]]:
             last_fetch_message=diag_msg,
             blacklisted_nodes=len(blacklist),
         )
+        failure_message = f"抓取节点失败: {diag_msg}"
+        print(f"[抓取节点] {failure_message}", flush=True)
+        log_to_json("ERROR", "Main", failure_message)
         raise RuntimeError(diag_msg)
 
     candidates = candidates[:MAX_CACHED_NODES]
     message = f"抓取到 {len(candidates)} 个候选节点，{' / '.join(source_summaries)}"
+    print(f"[抓取节点] {message}", flush=True)
     set_state(
         last_fetch_at=time.time(),
         last_fetch_status="ok",
