@@ -4412,6 +4412,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+  <div id="page_toast" style="position: fixed; top: 28px; left: 50%; transform: translateX(-50%) translateY(-12px); min-width: 220px; max-width: min(520px, calc(100vw - 32px)); padding: 12px 18px; border-radius: 10px; background: rgba(15, 23, 42, 0.96); color: #f8fafc; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 16px 40px rgba(0,0,0,0.35); font-size: 14px; line-height: 1.4; text-align: center; z-index: 9999; opacity: 0; pointer-events: none; transition: opacity .18s ease, transform .18s ease; backdrop-filter: blur(10px);"></div>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
@@ -4421,12 +4422,54 @@ let currentPageNodes = [];
 let sourcePool = null;
 let sourcePollInterval = null;
 let sourceProbePending = new Set();
+let toastTimer = null;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
 const base=p=>(p||"").split(/[\\/]/).pop();
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
 function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
+
+function showToast(message, kind = "info") {
+  const toast = $("page_toast");
+  if (!toast || !message) return;
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+
+  const palette = {
+    info: {
+      background: "rgba(15, 23, 42, 0.96)",
+      border: "rgba(255,255,255,0.1)",
+      color: "#f8fafc",
+    },
+    success: {
+      background: "rgba(6, 78, 59, 0.95)",
+      border: "rgba(52, 211, 153, 0.35)",
+      color: "#ecfdf5",
+    },
+    error: {
+      background: "rgba(127, 29, 29, 0.96)",
+      border: "rgba(248, 113, 113, 0.35)",
+      color: "#fef2f2",
+    },
+  };
+  const style = palette[kind] || palette.info;
+
+  toast.textContent = message;
+  toast.style.background = style.background;
+  toast.style.borderColor = style.border;
+  toast.style.color = style.color;
+  toast.style.opacity = "1";
+  toast.style.transform = "translateX(-50%) translateY(0)";
+
+  toastTimer = setTimeout(() => {
+    toast.style.opacity = "0";
+    toast.style.transform = "translateX(-50%) translateY(-12px)";
+    toastTimer = null;
+  }, 2200);
+}
 
 const translateQuality = q => {
   const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
@@ -6122,7 +6165,7 @@ function filterAndRenderLogs(forceRender = false) {
 async function copyLogContent() {
   const text = getRenderedLogText();
   if (!text || text.includes("暂无今日") || text.includes("暂无该类型")) {
-    alert("当前没有可供复制的日志。");
+    showToast("当前没有可供复制的日志。", "error");
     return;
   }
 
@@ -6130,7 +6173,7 @@ async function copyLogContent() {
   try {
     if (navigator.clipboard && window.isSecureContext) {
       await navigator.clipboard.writeText(text);
-      alert("日志内容已成功复制到剪贴板！");
+      showToast("日志内容已成功复制到剪贴板！", "success");
       return;
     }
   } catch (err) {
@@ -6158,16 +6201,16 @@ async function copyLogContent() {
   }
 
   if (copied) {
-    alert("日志内容已成功复制到剪贴板！");
+    showToast("日志内容已成功复制到剪贴板！", "success");
   } else {
-    alert("复制失败，请手动选中日志后按 Ctrl+C。");
+    showToast("复制失败，请手动选中日志后按 Ctrl+C。", "error");
   }
 }
 
 function exportLogContent() {
   const text = getRenderedLogText();
   if (!text || text.includes("暂无今日") || text.includes("暂无该类型")) {
-    alert("当前没有可供导出的日志。");
+    showToast("当前没有可供导出的日志。", "error");
     return;
   }
   
@@ -6182,6 +6225,7 @@ function exportLogContent() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+  showToast("日志文件已开始导出。", "success");
 }
 </script>
 </body></html>"""
