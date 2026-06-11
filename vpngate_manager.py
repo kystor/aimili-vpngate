@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -599,25 +600,116 @@ def parse_http_code_from_error(exc: Exception) -> int:
     match = re.search(r"(?:HTTP Error|status)\s+(\d{3})", text, re.IGNORECASE)
     return int(match.group(1)) if match else 0
 
-def probe_api_source(source_url: str) -> dict[str, Any]:
-    started_at = time.time()
-    try:
-        text = fetch_api_text(source_url, use_ssl_verify=source_url.startswith("https://"))
-        if not looks_like_vpngate_csv(text):
-            raise RuntimeError("返回内容不是 api/iphone CSV")
+def preview_api_text(text: str, limit: int = 80) -> str:
+    compact = " ".join(part.strip() for part in text.splitlines() if part.strip())
+    if not compact:
+        return "(空内容)"
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "..."
+
+def looks_like_html_response(text: str) -> bool:
+    lowered = text.lower()
+    markers = ("<!doctype html", "<html", "<head", "<body", "__viewstate", "<form")
+    return any(marker in lowered for marker in markers)
+
+def classify_fetch_exception(exc: Exception) -> dict[str, Any]:
+    http_code = parse_http_code_from_error(exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        reason = str(exc.reason or "").strip()
+        status_text = f"{exc.code}" if not reason else f"{exc.code} {reason}"
+        return {
+            "ok": False,
+            "http_code": exc.code,
+            "error_kind": "http_status",
+            "error_message": f"HTTP 状态异常：{status_text}",
+            "rows": [],
+            "is_empty_csv": False,
+        }
+
+    reason = getattr(exc, "reason", exc)
+    lowered = str(reason).lower()
+    if isinstance(reason, socket.timeout) or isinstance(exc, socket.timeout) or "timed out" in lowered or "timeout" in lowered:
+        return {
+            "ok": False,
+            "http_code": http_code,
+            "error_kind": "timeout",
+            "error_message": "请求超时",
+            "rows": [],
+            "is_empty_csv": False,
+        }
+
+    return {
+        "ok": False,
+        "http_code": http_code,
+        "error_kind": "request_error",
+        "error_message": f"请求失败：{exc}",
+        "rows": [],
+        "is_empty_csv": False,
+    }
+
+def validate_vpngate_api_text(text: str) -> dict[str, Any]:
+    if looks_like_html_response(text):
+        return {
+            "ok": False,
+            "http_code": 200,
+            "error_kind": "html",
+            "error_message": f"返回 HTML 页面，不是 VPNGate API CSV：{preview_api_text(text)}",
+            "rows": [],
+            "is_empty_csv": False,
+        }
+
+    if not looks_like_vpngate_csv(text):
+        return {
+            "ok": False,
+            "http_code": 200,
+            "error_kind": "invalid_csv",
+            "error_message": f"返回内容不是 VPNGate API CSV：{preview_api_text(text)}",
+            "rows": [],
+            "is_empty_csv": False,
+        }
+
+    rows = parse_vpngate_rows(text)
+    if not rows:
         return {
             "ok": True,
             "http_code": 200,
-            "error": "",
-            "checked_at": started_at,
+            "error_kind": "",
+            "error_message": "",
+            "rows": [],
+            "is_empty_csv": True,
         }
+
+    return {
+        "ok": True,
+        "http_code": 200,
+        "error_kind": "",
+        "error_message": "",
+        "rows": rows,
+        "is_empty_csv": False,
+    }
+
+def fetch_and_validate_source(source_url: str, use_ssl_verify: bool) -> dict[str, Any]:
+    try:
+        text = fetch_api_text(source_url, use_ssl_verify=use_ssl_verify)
     except Exception as exc:
-        return {
-            "ok": False,
-            "http_code": parse_http_code_from_error(exc),
-            "error": str(exc),
-            "checked_at": started_at,
-        }
+        result = classify_fetch_exception(exc)
+        result["used_url"] = source_url
+        return result
+
+    result = validate_vpngate_api_text(text)
+    result["used_url"] = source_url
+    return result
+
+def probe_api_source(source_url: str) -> dict[str, Any]:
+    started_at = time.time()
+    result = fetch_and_validate_source(source_url, use_ssl_verify=source_url.startswith("https://"))
+    return {
+        "ok": bool(result.get("ok")),
+        "http_code": max(0, parse_int(result.get("http_code"))),
+        "error": "" if result.get("ok") else str(result.get("error_message") or "连接失败"),
+        "checked_at": started_at,
+    }
 
 def source_page_urls() -> list[str]:
     raw_urls = [MIRROR_SITES_URL]
@@ -1284,6 +1376,8 @@ def fetch_candidates() -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_endpoints: set[tuple[str, int, str]] = set()
     source_summaries: list[str] = []
+    source_failures: list[str] = []
+    empty_csv_sources: list[str] = []
     has_cache = len(cached_nodes()) > 0
     source_urls = get_active_fetch_source_urls()
     if not source_urls:
@@ -1295,22 +1389,33 @@ def fetch_candidates() -> list[dict[str, Any]]:
             attempts.append((source_url, False))
             attempts.append((source_url.replace("https://", "http://", 1), True))
 
-        last_error: Exception | None = None
+        last_failure_message = ""
+        saw_empty_csv = False
         for url, verify_ssl in attempts:
             for attempt in range(max_attempts):
                 if attempt > 0:
                     time.sleep(1.5)
-                try:
-                    api_text = fetch_api_text(url, verify_ssl)
-                    rows = parse_vpngate_rows(api_text)
-                    if rows:
-                        return rows, url
-                except Exception as exc:
-                    last_error = exc
-                    print(f"[抓取节点] 来源失败: {url} -> {exc}", flush=True)
-                    log_to_json("WARNING", "Main", f"节点来源失败: {url} -> {exc}")
-        if last_error is not None:
-            raise last_error
+                result = fetch_and_validate_source(url, verify_ssl)
+                if result.get("ok"):
+                    rows = list(result.get("rows") or [])
+                    if result.get("is_empty_csv"):
+                        saw_empty_csv = True
+                        last_failure_message = "返回空 CSV，当前没有可用节点"
+                        notice = f"来源返回空 CSV: {url}"
+                        print(f"[抓取节点] {notice}", flush=True)
+                        log_to_json("WARNING", "Main", notice)
+                        continue
+                    return rows, str(result.get("used_url") or url)
+
+                last_failure_message = str(result.get("error_message") or "请求失败")
+                notice = f"来源失败: {url} -> {last_failure_message}"
+                print(f"[抓取节点] {notice}", flush=True)
+                log_to_json("WARNING", "Main", f"节点{notice}")
+
+        if saw_empty_csv:
+            raise RuntimeError("返回空 CSV，当前没有可用节点")
+        if last_failure_message:
+            raise RuntimeError(last_failure_message)
         raise RuntimeError("未获取到任何节点数据")
 
     start_message = f"开始抓取节点，共 {len(source_urls)} 个来源"
@@ -1321,11 +1426,17 @@ def fetch_candidates() -> list[dict[str, Any]]:
             rows, actual_url = fetch_rows_from_source(source_url, 1 if has_cache or index > 1 else 2)
             update_source_runtime_result(actual_url, True, "", 200)
         except Exception as exc:
-            update_source_runtime_result(source_url, False, str(exc), parse_http_code_from_error(exc))
-            failure_message = f"来源{index}抓取失败: {source_url} -> {exc}"
+            error_message = str(exc)
+            update_source_runtime_result(source_url, False, error_message, parse_http_code_from_error(exc))
+            failure_message = f"来源{index}抓取失败: {source_url} -> {error_message}"
             print(f"[抓取节点] {failure_message}", flush=True)
             log_to_json("WARNING", "Main", failure_message)
-            source_summaries.append(f"来源{index}抓取失败")
+            source_failures.append(failure_message)
+            if "返回空 CSV" in error_message:
+                empty_csv_sources.append(source_url)
+                source_summaries.append(f"来源{index}空CSV")
+            else:
+                source_summaries.append(f"来源{index}抓取失败")
             continue
 
         added = 0
@@ -1347,7 +1458,14 @@ def fetch_candidates() -> list[dict[str, Any]]:
         source_summaries.append(f"来源{index}抓取到 {added} 个")
 
     if not candidates:
-        err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
+        if empty_csv_sources and len(empty_csv_sources) == len(source_urls):
+            err_code = 1011
+            diag_msg = "所有来源都返回空 CSV，当前没有可用节点"
+        elif source_failures:
+            err_code = 1012
+            diag_msg = "所有来源请求完成，但返回内容异常或抓取失败：" + " | ".join(source_failures[:3])
+        else:
+            err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
         set_state(
             last_fetch_at=time.time(),
             last_fetch_status="error",
