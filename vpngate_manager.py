@@ -571,6 +571,19 @@ def save_source_pool(pool: dict[str, Any]) -> dict[str, Any]:
     write_json(SOURCES_FILE, normalized)
     return normalized
 
+def clone_source_entries(pool: dict[str, Any]) -> list[dict[str, Any]]:
+    return [dict(item) for item in pool.get("sources", []) if isinstance(item, dict)]
+
+def find_source_entry(entries: list[dict[str, Any]], normalized_url: str) -> dict[str, Any] | None:
+    for item in entries:
+        if normalize_source_url(item.get("url")) == normalized_url:
+            return item
+    return None
+
+def save_source_entries(pool: dict[str, Any], entries: list[dict[str, Any]]) -> dict[str, Any]:
+    pool["sources"] = entries
+    return save_source_pool(pool)
+
 def looks_like_vpngate_csv(text: str) -> bool:
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -836,23 +849,15 @@ def probe_single_source(url: str) -> dict[str, Any]:
         raise RuntimeError("源扫描正在进行中，请稍后再试")
     try:
         pool = load_source_pool()
-        sources = [dict(item) for item in pool.get("sources", [])]
-        target_entry: dict[str, Any] | None = None
-        for item in sources:
-            if normalize_source_url(item.get("url")) == normalized_url:
-                target_entry = item
-                break
+        sources = clone_source_entries(pool)
+        target_entry = find_source_entry(sources, normalized_url)
         if target_entry is None:
             raise ValueError("未找到对应的源")
 
         result = probe_api_source(normalized_url)
         update_source_entry_with_probe(target_entry, result)
-        pool["sources"] = sort_source_entries(sources)
-        saved_pool = save_source_pool(pool)
-        saved_entry = next(
-            (dict(item) for item in saved_pool.get("sources", []) if normalize_source_url(item.get("url")) == normalized_url),
-            dict(target_entry),
-        )
+        saved_pool = save_source_entries(pool, sources)
+        saved_entry = find_source_entry(clone_source_entries(saved_pool), normalized_url) or dict(target_entry)
         return {"pool": saved_pool, "entry": saved_entry, "result": result}
     finally:
         source_scan_lock.release()
@@ -862,63 +867,52 @@ def add_manual_source(url: str) -> dict[str, Any]:
     if not normalized_url:
         raise ValueError("源地址格式不正确，必须是 http/https")
     pool = load_source_pool()
-    deleted_urls = [item for item in normalize_deleted_source_urls(pool.get("deleted_urls", [])) if item != normalized_url]
-    pool["deleted_urls"] = deleted_urls
-    sources = [dict(item) for item in pool.get("sources", [])]
-    for item in sources:
-        if normalize_source_url(item.get("url")) == normalized_url:
-            item["type"] = "manual"
-            item["enabled"] = True
-            item["selected"] = True
-            pool["sources"] = sources
-            return save_source_pool(pool)
-    sources.append(default_source_entry(normalized_url, "manual"))
-    pool["sources"] = sources
-    return save_source_pool(pool)
+    pool["deleted_urls"] = [
+        item
+        for item in normalize_deleted_source_urls(pool.get("deleted_urls", []))
+        if item != normalized_url
+    ]
+    sources = clone_source_entries(pool)
+    target_entry = find_source_entry(sources, normalized_url)
+    if target_entry is None:
+        sources.append(default_source_entry(normalized_url, "manual"))
+    else:
+        target_entry["type"] = "manual"
+        target_entry["enabled"] = True
+        target_entry["selected"] = True
+    return save_source_entries(pool, sources)
 
 def delete_source(url: str) -> dict[str, Any]:
     normalized_url = normalize_source_url(url)
     if not normalized_url:
         raise ValueError("源地址不能为空")
     pool = load_source_pool()
-    kept: list[dict[str, Any]] = []
-    removed = False
-    for item in pool.get("sources", []):
-        if normalize_source_url(item.get("url")) == normalized_url:
-            removed = True
-            continue
-        kept.append(dict(item))
-    if not removed:
+    sources = clone_source_entries(pool)
+    kept_sources = [item for item in sources if normalize_source_url(item.get("url")) != normalized_url]
+    if len(kept_sources) == len(sources):
         raise ValueError("未找到对应的源")
-    pool["sources"] = kept
     deleted_urls = normalize_deleted_source_urls(pool.get("deleted_urls", []))
     if normalized_url not in deleted_urls:
         deleted_urls.append(normalized_url)
     pool["deleted_urls"] = deleted_urls
-    return save_source_pool(pool)
+    return save_source_entries(pool, kept_sources)
 
 def update_source_flags(url: str, *, enabled: bool | None = None, selected: bool | None = None) -> dict[str, Any]:
     normalized_url = normalize_source_url(url)
     if not normalized_url:
         raise ValueError("源地址不能为空")
     pool = load_source_pool()
-    changed = False
-    updated_sources: list[dict[str, Any]] = []
-    for item in pool.get("sources", []):
-        current = dict(item)
-        if normalize_source_url(current.get("url")) == normalized_url:
-            next_enabled = enabled
-            if next_enabled is None and selected is not None:
-                next_enabled = bool(selected)
-            if next_enabled is not None:
-                current["enabled"] = bool(next_enabled)
-                current["selected"] = bool(next_enabled)
-            changed = True
-        updated_sources.append(current)
-    if not changed:
+    sources = clone_source_entries(pool)
+    target_entry = find_source_entry(sources, normalized_url)
+    if target_entry is None:
         raise ValueError("未找到对应的源")
-    pool["sources"] = updated_sources
-    return save_source_pool(pool)
+    next_enabled = enabled
+    if next_enabled is None and selected is not None:
+        next_enabled = bool(selected)
+    if next_enabled is not None:
+        target_entry["enabled"] = bool(next_enabled)
+        target_entry["selected"] = bool(next_enabled)
+    return save_source_entries(pool, sources)
 
 def safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
@@ -992,63 +986,64 @@ def merge_node_runtime_fields(base_node: dict[str, Any], old_node: dict[str, Any
             merged[key] = old_node.get(key)
     return merged
 
-def legacy_fetch_text_from_many(urls: list[str]) -> list[tuple[str, str]]:
-    results: list[tuple[str, str]] = []
-    for url in urls:
-        try:
-            text = fetch_api_text(url, use_ssl_verify=url.startswith("https://"))
-            if text.strip():
-                results.append((url, text))
-        except Exception as exc:
-            print(f"[抓取节点] 来源失败: {url} -> {exc}", flush=True)
-            log_to_json("WARNING", "Main", f"节点来源失败: {url} -> {exc}")
-    return results
+def should_keep_missing_node(node: dict[str, Any]) -> bool:
+    if node.get("active"):
+        return True
+    return (
+        node.get("probe_status") == "available"
+        and 0 < parse_int(node.get("latency_ms")) <= KEEP_OLD_NODE_LATENCY_MS
+    )
 
-def legacy_load_mirror_site_urls() -> list[str]:
-    if not ENABLE_MIRROR_AGGREGATION:
-        return []
+def merge_latest_nodes(candidates: list[dict[str, Any]], old_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    old_by_endpoint = {node_endpoint_key(node): node for node in old_nodes}
+    merged_nodes: list[dict[str, Any]] = []
+    seen_endpoints: set[tuple[str, int, str]] = set()
 
-    cache_file = DATA_DIR / "mirror_sites_cache.json"
-    now = time.time()
-    try:
-        cache = read_json(cache_file, {})
-        cached_at = float(cache.get("cached_at", 0))
-        cached_urls = cache.get("urls", [])
-        if now - cached_at <= MIRROR_LIST_CACHE_SECONDS and isinstance(cached_urls, list):
-            return [str(item) for item in cached_urls if str(item).strip()]
-    except Exception:
-        pass
+    for candidate in candidates:
+        key = node_endpoint_key(candidate)
+        old_node = old_by_endpoint.get(key)
+        merged = merge_node_runtime_fields(candidate, old_node) if old_node else dict(candidate)
+        merged["missing_from_latest_fetch"] = False
+        merged_nodes.append(merged)
+        seen_endpoints.add(key)
 
-    urls: list[str] = []
-    for source_url in MIRROR_SITES_URLS:
-        try:
-            text = fetch_api_text(source_url)
-        except Exception as exc:
-            print(f"[镜像列表] 获取失败: {source_url} -> {exc}", flush=True)
+    for old_node in old_nodes:
+        key = node_endpoint_key(old_node)
+        if key in seen_endpoints or not should_keep_missing_node(old_node):
             continue
-        for match in re.findall(r"https?://[A-Za-z0-9._:/?=&%-]+", text):
-            clean = match.rstrip("/ \t\r\n")
-            if clean not in urls:
-                urls.append(clean)
+        kept = dict(old_node)
+        kept["missing_from_latest_fetch"] = True
+        merged_nodes.append(kept)
+        seen_endpoints.add(key)
 
-    urls = urls[:MAX_MIRROR_SOURCES]
+    return sort_all_nodes(merged_nodes)[:MAX_CACHED_NODES]
+
+def recover_connection_if_needed(final_nodes: list[dict[str, Any]], ui_cfg: dict[str, Any]) -> None:
+    global is_connecting
+    if not ui_cfg.get("connection_enabled", True) or active_openvpn_running():
+        return
+
+    if ui_cfg.get("routing_mode") == "fixed_ip":
+        target_id = str(ui_cfg.get("fixed_node_id") or active_openvpn_node_id or "").strip()
+        if not target_id or not any(node.get("id") == target_id for node in final_nodes):
+            return
+        action = lambda: connect_node(target_id)
+    else:
+        available_nodes = filter_nodes_for_routing(
+            [node for node in final_nodes if node.get("probe_status") == "available"],
+            ui_cfg,
+        )
+        if not available_nodes:
+            return
+        action = auto_switch_node
+
+    with lock:
+        is_connecting = False
     try:
-        write_json(cache_file, {"cached_at": now, "urls": urls})
-    except Exception:
-        pass
-    return urls
-
-def legacy_collect_candidate_source_urls() -> list[str]:
-    urls: list[str] = []
-    for item in [API_URL, *EXTRA_VPNGATE_API_URLS]:
-        if item and item not in urls:
-            urls.append(item)
-
-    for mirror_url in load_mirror_site_urls():
-        api_url = mirror_url.rstrip("/") + "/api/iphone/"
-        if api_url not in urls:
-            urls.append(api_url)
-    return urls
+        action()
+    finally:
+        with lock:
+            is_connecting = True
 
 def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_ssl_verify: bool = True) -> str:
     import socket
@@ -2250,7 +2245,7 @@ def connect_node(node_id: str) -> str:
         with lock:
             is_connecting = False
 
-def maintain_valid_nodes(force: bool = False) -> str:
+def run_node_inventory_job(*, force: bool, disconnect_active: bool, full_refresh: bool) -> str:
     global is_connecting
     ensure_dirs()
     if not maintain_job_lock.acquire(blocking=False):
@@ -2259,124 +2254,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
     with lock:
         is_connecting = True
 
+    heavy_task_acquired = False
     try:
         heavy_task_lock.acquire()
-        if force:
-            stop_active_openvpn()
-
-        set_state(is_connecting=True, last_check_message="正在抓取最新节点列表")
-        try:
-            candidates = fetch_candidates()
-        except Exception as exc:
-            vpn_utils.check_and_fix_dns()
-            set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=str(exc))
-            return f"抓取节点失败: {exc}"
-
-        with lock:
-            old_nodes = read_json(NODES_FILE, [])
-            active_node = next((node for node in old_nodes if node.get("active")), None)
-
-        old_by_endpoint = {node_endpoint_key(node): node for node in old_nodes}
-        merged_nodes: list[dict[str, Any]] = []
-        seen_endpoints: set[tuple[str, int, str]] = set()
-
-        for candidate in candidates:
-            key = node_endpoint_key(candidate)
-            old_node = old_by_endpoint.get(key)
-            merged = merge_node_runtime_fields(candidate, old_node) if old_node else dict(candidate)
-            merged["missing_from_latest_fetch"] = False
-            merged_nodes.append(merged)
-            seen_endpoints.add(key)
-
-        for old_node in old_nodes:
-            key = node_endpoint_key(old_node)
-            if key in seen_endpoints:
-                continue
-            if old_node.get("active"):
-                kept = dict(old_node)
-                kept["missing_from_latest_fetch"] = True
-                merged_nodes.append(kept)
-                seen_endpoints.add(key)
-                continue
-            if (
-                old_node.get("probe_status") == "available"
-                and 0 < parse_int(old_node.get("latency_ms")) <= KEEP_OLD_NODE_LATENCY_MS
-            ):
-                kept = dict(old_node)
-                kept["missing_from_latest_fetch"] = True
-                merged_nodes.append(kept)
-                seen_endpoints.add(key)
-
-        merged_nodes = sort_all_nodes(merged_nodes)[:MAX_CACHED_NODES]
-        write_json(NODES_FILE, merged_nodes)
-
-        to_test = select_node_ids_for_testing(
-            merged_nodes,
-            limit=MAX_MAINTAIN_TEST_NODES,
-            exclude_active=True,
-            probe_statuses={"not_checked", "unavailable", "error", ""},
-        )
-
-        if to_test:
-            set_state(is_connecting=True, last_check_message=f"正在检测 {len(to_test)} 个节点")
-            test_multiple_nodes(to_test)
-
-        final_nodes = read_json(NODES_FILE, [])
-        valid_nodes_count = len([node for node in final_nodes if node.get("probe_status") == "available"])
-
-        ui_cfg = load_ui_config()
-        if ui_cfg.get("connection_enabled", True) and not active_openvpn_running():
-            if ui_cfg.get("routing_mode") == "fixed_ip":
-                target_id = str(ui_cfg.get("fixed_node_id") or active_openvpn_node_id or "").strip()
-                if target_id and any(node.get("id") == target_id for node in final_nodes):
-                    with lock:
-                        is_connecting = False
-                    try:
-                        connect_node(target_id)
-                    finally:
-                        with lock:
-                            is_connecting = True
-            else:
-                filtered_available = filter_nodes_for_routing(
-                    [node for node in final_nodes if node.get("probe_status") == "available"],
-                    ui_cfg,
-                )
-                if filtered_available:
-                    with lock:
-                        is_connecting = False
-                    try:
-                        auto_switch_node()
-                    finally:
-                        with lock:
-                            is_connecting = True
-
-        message = f"已抓取 {len(candidates)} 个节点，当前可用 {valid_nodes_count} 个"
-        set_state(
-            last_check_at=time.time(),
-            last_check_message=message,
-            valid_nodes=valid_nodes_count,
-            active_openvpn_node_id=active_openvpn_node_id,
-            is_connecting=False,
-        )
-        schedule_followup_tests(FOLLOWUP_TEST_BATCH_SIZE)
-        return message
-    finally:
-        heavy_task_lock.release()
-        with lock:
-            is_connecting = False
-        maintain_job_lock.release()
-
-def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> str:
-    global is_connecting
-    ensure_dirs()
-    if not maintain_job_lock.acquire(blocking=False):
-        return "节点维护已在进行中"
-
-    with lock:
-        is_connecting = True
-
-    try:
-        heavy_task_lock.acquire()
+        heavy_task_acquired = True
         if force and disconnect_active:
             stop_active_openvpn()
 
@@ -2386,135 +2267,108 @@ def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> st
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             failed_at = time.time()
-            cooldown_until = failed_at + AUTO_REFRESH_COOLDOWN_SECONDS if not force else 0.0
-            message = f"抓取节点失败: {exc}"
-            if cooldown_until > 0:
-                message += "，自动补抓进入 1 小时冷却"
-            set_state(
-                last_fetch_at=failed_at,
-                last_fetch_status="error",
-                last_fetch_message=message,
-                last_check_at=failed_at,
-                last_check_message=message,
-                auto_refresh_completed_at=failed_at,
-                auto_refresh_cooldown_until=cooldown_until,
-                is_connecting=False,
-            )
-            return message
+            if full_refresh:
+                cooldown_until = failed_at + AUTO_REFRESH_COOLDOWN_SECONDS if not force else 0.0
+                message = f"抓取节点失败: {exc}"
+                if cooldown_until > 0:
+                    message += "，自动补抓进入 1 小时冷却"
+                set_state(
+                    last_fetch_at=failed_at,
+                    last_fetch_status="error",
+                    last_fetch_message=message,
+                    last_check_at=failed_at,
+                    last_check_message=message,
+                    auto_refresh_completed_at=failed_at,
+                    auto_refresh_cooldown_until=cooldown_until,
+                    is_connecting=False,
+                )
+                return message
+            set_state(last_fetch_at=failed_at, last_fetch_status="error", last_fetch_message=str(exc))
+            return f"抓取节点失败: {exc}"
 
         with lock:
             old_nodes = read_json(NODES_FILE, [])
-
-        old_by_endpoint = {node_endpoint_key(node): node for node in old_nodes}
-        merged_nodes: list[dict[str, Any]] = []
-        seen_endpoints: set[tuple[str, int, str]] = set()
-
-        for candidate in candidates:
-            key = node_endpoint_key(candidate)
-            old_node = old_by_endpoint.get(key)
-            merged = merge_node_runtime_fields(candidate, old_node) if old_node else dict(candidate)
-            merged["missing_from_latest_fetch"] = False
-            merged_nodes.append(merged)
-            seen_endpoints.add(key)
-
-        for old_node in old_nodes:
-            key = node_endpoint_key(old_node)
-            if key in seen_endpoints:
-                continue
-            if old_node.get("active"):
-                kept = dict(old_node)
-                kept["missing_from_latest_fetch"] = True
-                merged_nodes.append(kept)
-                seen_endpoints.add(key)
-                continue
-            if (
-                old_node.get("probe_status") == "available"
-                and 0 < parse_int(old_node.get("latency_ms")) <= KEEP_OLD_NODE_LATENCY_MS
-            ):
-                kept = dict(old_node)
-                kept["missing_from_latest_fetch"] = True
-                merged_nodes.append(kept)
-                seen_endpoints.add(key)
-
-        merged_nodes = sort_all_nodes(merged_nodes)[:MAX_CACHED_NODES]
+        merged_nodes = merge_latest_nodes(candidates, old_nodes)
         write_json(NODES_FILE, merged_nodes)
 
         ui_cfg = load_ui_config()
-        pending_ids = select_node_ids_for_testing(
-            merged_nodes,
-            exclude_active=True,
-            routed_only=True,
-            ui_cfg=ui_cfg,
-            probe_statuses={"not_checked", "unavailable", "error", ""},
-        )
-
-        while pending_ids:
-            current_nodes = read_json(NODES_FILE, [])
-            routed_valid_nodes = count_available_nodes_for_routing(current_nodes, ui_cfg)
-            if routed_valid_nodes >= TARGET_VALID_NODES:
-                break
-            batch_ids = pending_ids[:MAX_BATCH_TEST_REQUEST_SIZE]
-            pending_ids = pending_ids[MAX_BATCH_TEST_REQUEST_SIZE:]
-            set_state(is_connecting=True, last_check_message=f"正在检测 {len(batch_ids)} 个节点")
-            test_multiple_nodes(batch_ids)
+        if full_refresh:
+            pending_ids = select_node_ids_for_testing(
+                merged_nodes,
+                exclude_active=True,
+                routed_only=True,
+                ui_cfg=ui_cfg,
+                probe_statuses={"not_checked", "unavailable", "error", ""},
+            )
+            while pending_ids:
+                current_nodes = read_json(NODES_FILE, [])
+                if count_available_nodes_for_routing(current_nodes, ui_cfg) >= TARGET_VALID_NODES:
+                    break
+                batch_ids = pending_ids[:MAX_BATCH_TEST_REQUEST_SIZE]
+                pending_ids = pending_ids[MAX_BATCH_TEST_REQUEST_SIZE:]
+                set_state(is_connecting=True, last_check_message=f"正在检测 {len(batch_ids)} 个节点")
+                test_multiple_nodes(batch_ids)
+        else:
+            to_test = select_node_ids_for_testing(
+                merged_nodes,
+                limit=MAX_MAINTAIN_TEST_NODES,
+                exclude_active=True,
+                probe_statuses={"not_checked", "unavailable", "error", ""},
+            )
+            if to_test:
+                set_state(is_connecting=True, last_check_message=f"正在检测 {len(to_test)} 个节点")
+                test_multiple_nodes(to_test)
 
         final_nodes = read_json(NODES_FILE, [])
         valid_nodes_count = len([node for node in final_nodes if node.get("probe_status") == "available"])
         routed_valid_nodes = count_available_nodes_for_routing(final_nodes, ui_cfg)
-        refresh_completed_at = time.time()
-        cooldown_until = refresh_completed_at + AUTO_REFRESH_COOLDOWN_SECONDS if routed_valid_nodes < TARGET_VALID_NODES else 0.0
+        recover_connection_if_needed(final_nodes, ui_cfg)
+        completed_at = time.time()
 
-        if ui_cfg.get("connection_enabled", True) and not active_openvpn_running():
-            if ui_cfg.get("routing_mode") == "fixed_ip":
-                target_id = str(ui_cfg.get("fixed_node_id") or active_openvpn_node_id or "").strip()
-                if target_id and any(node.get("id") == target_id for node in final_nodes):
-                    with lock:
-                        is_connecting = False
-                    try:
-                        connect_node(target_id)
-                    finally:
-                        with lock:
-                            is_connecting = True
-            else:
-                filtered_available = filter_nodes_for_routing(
-                    [node for node in final_nodes if node.get("probe_status") == "available"],
-                    ui_cfg,
-                )
-                if filtered_available:
-                    with lock:
-                        is_connecting = False
-                    try:
-                        auto_switch_node()
-                    finally:
-                        with lock:
-                            is_connecting = True
-
-        message = f"已抓取 {len(candidates)} 个节点，当前可用 {valid_nodes_count} 个，当前协议可用 {routed_valid_nodes} 个"
-        if cooldown_until > 0:
-            message += "，库存不足，进入 1 小时冷却"
-
-        set_state(
-            last_fetch_at=refresh_completed_at,
-            last_fetch_status="success",
-            last_fetch_message=message,
-            last_check_at=refresh_completed_at,
-            last_check_message=message,
-            valid_nodes=valid_nodes_count,
-            routed_valid_nodes=routed_valid_nodes,
-            auto_refresh_completed_at=refresh_completed_at,
-            auto_refresh_cooldown_until=cooldown_until,
-            last_available_recheck_completed_at=refresh_completed_at,
-            available_recheck_message=f"完整节点测试完成，共确认 {valid_nodes_count} 个可用节点",
-            active_openvpn_node_id=active_openvpn_node_id,
-            is_connecting=False,
-        )
+        if full_refresh:
+            cooldown_until = completed_at + AUTO_REFRESH_COOLDOWN_SECONDS if routed_valid_nodes < TARGET_VALID_NODES else 0.0
+            message = f"已抓取 {len(candidates)} 个节点，当前可用 {valid_nodes_count} 个，当前协议可用 {routed_valid_nodes} 个"
+            if cooldown_until > 0:
+                message += "，库存不足，进入 1 小时冷却"
+            set_state(
+                last_fetch_at=completed_at,
+                last_fetch_status="success",
+                last_fetch_message=message,
+                last_check_at=completed_at,
+                last_check_message=message,
+                valid_nodes=valid_nodes_count,
+                routed_valid_nodes=routed_valid_nodes,
+                auto_refresh_completed_at=completed_at,
+                auto_refresh_cooldown_until=cooldown_until,
+                last_available_recheck_completed_at=completed_at,
+                available_recheck_message=f"完整节点测试完成，共确认 {valid_nodes_count} 个可用节点",
+                active_openvpn_node_id=active_openvpn_node_id,
+                is_connecting=False,
+            )
+        else:
+            message = f"已抓取 {len(candidates)} 个节点，当前可用 {valid_nodes_count} 个"
+            set_state(
+                last_check_at=completed_at,
+                last_check_message=message,
+                valid_nodes=valid_nodes_count,
+                routed_valid_nodes=routed_valid_nodes,
+                active_openvpn_node_id=active_openvpn_node_id,
+                is_connecting=False,
+            )
         schedule_followup_tests(FOLLOWUP_TEST_BATCH_SIZE)
         return message
     finally:
-        heavy_task_lock.release()
+        if heavy_task_acquired:
+            heavy_task_lock.release()
         with lock:
             is_connecting = False
         maintain_job_lock.release()
+
+def maintain_valid_nodes(force: bool = False) -> str:
+    return run_node_inventory_job(force=force, disconnect_active=force, full_refresh=False)
+
+def run_node_refresh(force: bool = False, disconnect_active: bool = False) -> str:
+    return run_node_inventory_job(force=force, disconnect_active=disconnect_active, full_refresh=True)
 
 def collector_loop() -> None:
     global last_collector_heartbeat
