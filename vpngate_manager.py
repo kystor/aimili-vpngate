@@ -600,14 +600,6 @@ def parse_http_code_from_error(exc: Exception) -> int:
     match = re.search(r"(?:HTTP Error|status)\s+(\d{3})", text, re.IGNORECASE)
     return int(match.group(1)) if match else 0
 
-def preview_api_text(text: str, limit: int = 80) -> str:
-    compact = " ".join(part.strip() for part in text.splitlines() if part.strip())
-    if not compact:
-        return "(空内容)"
-    if len(compact) <= limit:
-        return compact
-    return compact[:limit] + "..."
-
 def looks_like_html_response(text: str) -> bool:
     lowered = text.lower()
     markers = ("<!doctype html", "<html", "<head", "<body", "__viewstate", "<form")
@@ -654,7 +646,7 @@ def validate_vpngate_api_text(text: str) -> dict[str, Any]:
             "ok": False,
             "http_code": 200,
             "error_kind": "html",
-            "error_message": f"返回 HTML 页面，不是 VPNGate API CSV：{preview_api_text(text)}",
+            "error_message": "节点源返回的是网页，不是可用的节点列表",
             "rows": [],
             "is_empty_csv": False,
         }
@@ -664,7 +656,7 @@ def validate_vpngate_api_text(text: str) -> dict[str, Any]:
             "ok": False,
             "http_code": 200,
             "error_kind": "invalid_csv",
-            "error_message": f"返回内容不是 VPNGate API CSV：{preview_api_text(text)}",
+            "error_message": "节点源返回的数据格式不正确，不是可用的节点列表",
             "rows": [],
             "is_empty_csv": False,
         }
@@ -1391,7 +1383,9 @@ def fetch_candidates() -> list[dict[str, Any]]:
 
         last_failure_message = ""
         saw_empty_csv = False
+        tried_urls: list[str] = []
         for url, verify_ssl in attempts:
+            tried_urls.append(url)
             for attempt in range(max_attempts):
                 if attempt > 0:
                     time.sleep(1.5)
@@ -1401,21 +1395,17 @@ def fetch_candidates() -> list[dict[str, Any]]:
                     if result.get("is_empty_csv"):
                         saw_empty_csv = True
                         last_failure_message = "返回空 CSV，当前没有可用节点"
-                        notice = f"来源返回空 CSV: {url}"
-                        print(f"[抓取节点] {notice}", flush=True)
-                        log_to_json("WARNING", "Main", notice)
                         continue
                     return rows, str(result.get("used_url") or url)
 
                 last_failure_message = str(result.get("error_message") or "请求失败")
-                notice = f"来源失败: {url} -> {last_failure_message}"
-                print(f"[抓取节点] {notice}", flush=True)
-                log_to_json("WARNING", "Main", f"节点{notice}")
 
         if saw_empty_csv:
-            raise RuntimeError("返回空 CSV，当前没有可用节点")
+            urls_text = " / ".join(dict.fromkeys(tried_urls))
+            raise RuntimeError(f"返回空 CSV，当前没有可用节点（已尝试：{urls_text}）")
         if last_failure_message:
-            raise RuntimeError(last_failure_message)
+            urls_text = " / ".join(dict.fromkeys(tried_urls))
+            raise RuntimeError(f"{last_failure_message}（已尝试：{urls_text}）")
         raise RuntimeError("未获取到任何节点数据")
 
     start_message = f"开始抓取节点，共 {len(source_urls)} 个来源"
@@ -1463,7 +1453,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
             diag_msg = "所有来源都返回空 CSV，当前没有可用节点"
         elif source_failures:
             err_code = 1012
-            diag_msg = "所有来源请求完成，但返回内容异常或抓取失败：" + " | ".join(source_failures[:3])
+            diag_msg = "所有来源请求完成，但返回内容异常或抓取失败"
         else:
             err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
         set_state(
