@@ -23,6 +23,7 @@ from typing import Any
 import concurrent.futures
 import sys
 import uuid
+from datetime import datetime, timezone, timedelta
 
 # 启动阶段优先整理基础网络解析行为
 # Prefer IPv4 resolution to avoid slow AAAA DNS timeouts (e.g. in WSL),
@@ -43,6 +44,11 @@ def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         return _orig_getaddrinfo(host, port, 0, type, proto, flags)
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
 socket.getaddrinfo = _ipv4_getaddrinfo
+
+SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+def shanghai_now_str() -> str:
+    return datetime.now(SHANGHAI_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
 class DualStackHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
@@ -374,7 +380,7 @@ def log_to_json(level: str, module: str, message: str) -> None:
         date_str = time.strftime("%Y-%m-%d", time.localtime())
         log_file = logs_dir / f"{date_str}.json"
         entry = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "timestamp": shanghai_now_str(),
             "level": level,
             "module": module,
             "message": message
@@ -7301,6 +7307,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
