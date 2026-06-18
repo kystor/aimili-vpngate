@@ -331,6 +331,30 @@ def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
         except Exception:
             pass
 
+def normalize_ip_type(ip_type: Any, quality: Any = "", usage_type: Any = "", as_type: Any = "", company_type: Any = "") -> str:
+    text = " ".join(str(part or "").strip().lower() for part in [ip_type, quality, usage_type, as_type, company_type])
+    hosting_words = ("hosting", "datacenter", "data center", "idc", "机房", "数据中心", "云服务", "服务器", "托管")
+    if any(word in text for word in hosting_words):
+        return "hosting"
+    # IP类型只区分住宅和机房，代理/移动等特征继续放在网络质量中展示。
+    return "residential"
+
+def fetch_iping_ip_type(ip: str) -> str:
+    url = "https://api.iping.cc/v1/query?" + urllib.parse.urlencode({"ip": ip, "language": "zh"})
+    request = urllib.request.Request(url, headers={"User-Agent": "vpngate-manager/2.2"})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    data = payload.get("data") if payload.get("code") == 200 else None
+    if not isinstance(data, dict):
+        return ""
+    return normalize_ip_type(
+        data.get("type"),
+        "",
+        data.get("usage_type"),
+        data.get("as_type"),
+        data.get("company_type"),
+    )
+
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     # 1. Read cache thread-safely
     with ip_cache_lock:
@@ -349,7 +373,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             node["asn"] = cached.get("asn", "")
             node["as_name"] = cached.get("as_name", "")
             node["location"] = cached.get("location", "")
-            node["ip_type"] = cached.get("ip_type", "")
+            node["ip_type"] = normalize_ip_type(cached.get("ip_type"), cached.get("quality"))
             node["quality"] = cached.get("quality", "")
         else:
             if ip not in ips_to_query:
@@ -361,6 +385,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     # 2. Perform HTTP query outside lock
     new_entries = {}
     chunk_size = 100
+    iping_available = True
     for i in range(0, len(ips_to_query), chunk_size):
         chunk = ips_to_query[i : i + chunk_size]
         payload = json.dumps(chunk).encode("utf-8")
@@ -380,14 +405,6 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                     if not query_ip:
                         continue
 
-                    ip_type = "residential"
-                    if item.get("mobile"):
-                        ip_type = "mobile"
-                    elif item.get("proxy"):
-                        ip_type = "proxy"
-                    elif item.get("hosting"):
-                        ip_type = "hosting"
-
                     quality = "normal"
                     if item.get("proxy"):
                         quality = "proxy"
@@ -395,6 +412,14 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                         quality = "datacenter"
                     elif item.get("mobile"):
                         quality = "mobile"
+
+                    ip_type = normalize_ip_type("hosting" if item.get("hosting") else "residential", quality)
+                    if iping_available:
+                        try:
+                            ip_type = fetch_iping_ip_type(query_ip) or ip_type
+                        except Exception as e:
+                            iping_available = False
+                            print(f"[enrich_ip_info] IPing 类型查询失败，已回退到 ip-api: {e}", flush=True)
 
                     loc = " ".join(part for part in [item.get("country"), item.get("regionName"), item.get("city")] if part)
 
@@ -428,7 +453,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             node["asn"] = cached.get("asn", "")
             node["as_name"] = cached.get("as_name", "")
             node["location"] = cached.get("location", "")
-            node["ip_type"] = cached.get("ip_type", "")
+            node["ip_type"] = normalize_ip_type(cached.get("ip_type"), cached.get("quality"))
             node["quality"] = cached.get("quality", "")
 
 
@@ -621,4 +646,4 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
             except Exception:
                 pass
 
-    return None
+    return None
