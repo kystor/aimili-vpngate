@@ -3551,8 +3551,8 @@ INDEX_HTML = r"""<!doctype html>
     .nodes-table .col-location { width: 148px; text-align: center; }
     .nodes-table .col-asn { width: 140px; text-align: center; }
     .nodes-table .col-owner { width: 140px; text-align: center; }
-    .nodes-table .col-quality { width: 70px; text-align: center; }
-    .nodes-table .col-ip-type { width: 65px; text-align: center; }
+    .nodes-table .col-quality { width: 60px; text-align: center; }
+    .nodes-table .col-ip-type { width: 55px; text-align: center; }
     .nodes-table .col-actions { width: 122px; text-align: center; }
 
     .nodes-table tr {
