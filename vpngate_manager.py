@@ -2430,7 +2430,7 @@ def run_node_inventory_job(*, force: bool, disconnect_active: bool, full_refresh
                 batch_ids = pending_ids[:MAX_BATCH_TEST_REQUEST_SIZE]
                 pending_ids = pending_ids[MAX_BATCH_TEST_REQUEST_SIZE:]
                 set_state(is_connecting=True, last_check_message=f"正在检测 {len(batch_ids)} 个节点")
-                test_multiple_nodes(batch_ids)
+                run_node_test_batches(batch_ids, len(batch_ids))
         else:
             to_test = select_node_ids_for_testing(
                 merged_nodes,
@@ -2440,7 +2440,7 @@ def run_node_inventory_job(*, force: bool, disconnect_active: bool, full_refresh
             )
             if to_test:
                 set_state(is_connecting=True, last_check_message=f"正在检测 {len(to_test)} 个节点")
-                test_multiple_nodes(to_test)
+                run_node_test_batches(to_test, len(to_test))
 
         final_nodes = read_json(NODES_FILE, [])
         valid_nodes_count = len([node for node in final_nodes if node.get("probe_status") == "available"])
@@ -2463,7 +2463,6 @@ def run_node_inventory_job(*, force: bool, disconnect_active: bool, full_refresh
                 routed_valid_nodes=routed_valid_nodes,
                 auto_refresh_completed_at=completed_at,
                 auto_refresh_cooldown_until=cooldown_until,
-                last_available_recheck_completed_at=completed_at,
                 available_recheck_message=f"完整节点测试完成，共确认 {valid_nodes_count} 个可用节点",
                 active_openvpn_node_id=active_openvpn_node_id,
                 is_connecting=False,
@@ -3624,6 +3623,12 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(245, 158, 11, 0.1);
       color: #fbbf24;
       border-color: rgba(245, 158, 11, 0.2);
+    }
+
+    .testing {
+      background: rgba(56, 189, 248, 0.12);
+      color: #38bdf8;
+      border-color: rgba(56, 189, 248, 0.25);
     }
 
     .current-badge {
@@ -5027,17 +5032,19 @@ function render(){
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
       const isCurrentlyActive = activeNode && n.id === activeNode.id;
+      const isTesting = testingNodeIds.has(n.id) || Boolean(n.is_testing);
       const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
       
-      const badgeClass = isCurrentlyActive ? 'available' : (n.probe_status || 'not_checked');
-      const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(n.probe_status);
+      const badgeClass = isCurrentlyActive ? 'available' : (isTesting ? 'testing' : (n.probe_status || 'not_checked'));
+      const badgeText = isCurrentlyActive
+        ? '<span class="badge-pulse"></span>已连接'
+        : (isTesting ? '<span class="badge-pulse"></span>检测中' : translateStatus(n.probe_status));
       const latencyClass = getLatencyClass(n.latency_ms);
       const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms}&nbsp;ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
       const protoClass = normalizeProtoLabel(n.proto) || "udp";
       const protoText = formatProtoLabel(n.proto);
       
-      const isTesting = testingNodeIds.has(n.id) || Boolean(n.is_testing);
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
       const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
@@ -7123,7 +7130,7 @@ class Handler(BaseHTTPRequestHandler):
                 node_ids = payload.get("ids", [])
                 heavy_task_lock.acquire()
                 try:
-                    tested_nodes = test_multiple_nodes(node_ids)
+                    tested_nodes = run_node_test_batches(node_ids, len(node_ids) or 1)
                 finally:
                     heavy_task_lock.release()
                 self.send_json({"ok": True, "nodes": tested_nodes})
@@ -7172,7 +7179,11 @@ class Handler(BaseHTTPRequestHandler):
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 node_id = str(payload.get("id") or "")
-                updated_node = test_node_by_id(node_id)
+                set_node_testing_state([node_id], True)
+                try:
+                    updated_node = test_node_by_id(node_id)
+                finally:
+                    set_node_testing_state([node_id], False)
                 self.send_json({"ok": True, "node": updated_node})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -7307,4 +7318,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
