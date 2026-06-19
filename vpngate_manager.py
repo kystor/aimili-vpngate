@@ -2120,6 +2120,25 @@ def schedule_available_recheck(reason: str = "周期复检到期") -> bool:
             available_recheck_pending = False
         set_state(available_recheck_pending=False)
 
+    def mark_recheck_started(started_at: float) -> None:
+        message = "正在后台周期复检全部可用节点"
+        set_state(
+            available_recheck_running=True,
+            available_recheck_pending=False,
+            last_available_recheck_started_at=started_at,
+            available_recheck_message=message,
+        )
+        log_to_json("INFO", "Main", message)
+
+    def mark_recheck_empty(completed_at: float) -> None:
+        message = "当前没有可供周期复检的可用节点"
+        set_state(
+            available_recheck_running=False,
+            last_available_recheck_completed_at=completed_at,
+            available_recheck_message=message,
+        )
+        log_to_json("INFO", "Main", message)
+
     return run_background_node_test_job(
         job_lock=available_recheck_lock,
         task_name="周期复检",
@@ -2130,17 +2149,8 @@ def schedule_available_recheck(reason: str = "周期复检到期") -> bool:
         batch_size=MAX_BATCH_TEST_REQUEST_SIZE,
         skip_active=True,
         on_queued=lambda: set_state(available_recheck_pending=True, available_recheck_message=f"{reason}，已加入后台队列"),
-        on_started=lambda started_at: set_state(
-            available_recheck_running=True,
-            available_recheck_pending=False,
-            last_available_recheck_started_at=started_at,
-            available_recheck_message="正在后台周期复检全部可用节点",
-        ),
-        on_empty=lambda completed_at: set_state(
-            available_recheck_running=False,
-            last_available_recheck_completed_at=completed_at,
-            available_recheck_message="当前没有可供周期复检的可用节点",
-        ),
+        on_started=mark_recheck_started,
+        on_empty=mark_recheck_empty,
         on_success=lambda node_ids, completed_at: (
             set_state(
                 available_recheck_running=False,
@@ -2467,6 +2477,7 @@ def run_node_inventory_job(*, force: bool, disconnect_active: bool, full_refresh
                 active_openvpn_node_id=active_openvpn_node_id,
                 is_connecting=False,
             )
+            log_to_json("INFO", "Main", message)
         else:
             message = f"已抓取 {len(candidates)} 个节点，当前可用 {valid_nodes_count} 个"
             set_state(
@@ -3544,13 +3555,13 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .nodes-table .col-status { width: 65px; text-align: center; }
-    .nodes-table .col-latency { width: 64px; text-align: center; }
+    .nodes-table .col-latency { width: 54px; text-align: center; }
     .nodes-table .col-address { width: 165px; text-align: center; }
     .nodes-table .col-proto { width: 70px; text-align: center; }
     .nodes-table .col-location { width: 148px; text-align: center; }
     .nodes-table .col-asn { width: 140px; text-align: center; }
     .nodes-table .col-owner { width: 140px; text-align: center; }
-    .nodes-table .col-quality { width: 60px; text-align: center; }
+    .nodes-table .col-quality { width: 50px; text-align: center; }
     .nodes-table .col-ip-type { width: 55px; text-align: center; }
     .nodes-table .col-actions { width: 122px; text-align: center; }
 
