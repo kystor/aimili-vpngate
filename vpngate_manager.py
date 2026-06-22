@@ -3317,18 +3317,42 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .toolbar select {
-      width: 180px;
+      width: auto;
       height: 42px;
       background: rgba(255, 255, 255, 0.03);
       border: 1px solid var(--border-color);
       border-radius: 8px;
-      padding: 0 12px;
+      padding: 0 34px 0 16px;
       color: var(--text-primary);
       font-family: inherit;
       font-size: 14px;
       outline: none;
       transition: all 0.2s ease;
       cursor: pointer;
+      appearance: none;
+    }
+
+    .compact-select {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      flex: 0 0 auto;
+      width: fit-content;
+    }
+
+    .compact-select::after,
+    .routing-select-wrapper.has-select::after {
+      content: "";
+      position: absolute;
+      right: 14px;
+      top: 50%;
+      width: 7px;
+      height: 7px;
+      border-right: 2px solid currentColor;
+      border-bottom: 2px solid currentColor;
+      color: var(--text-secondary);
+      pointer-events: none;
+      transform: translateY(-65%) rotate(45deg);
     }
 
     .routing-select-wrapper {
@@ -3346,6 +3370,11 @@ INDEX_HTML = r"""<!doctype html>
       flex: 0 0 auto;
     }
 
+    .routing-select-wrapper.has-select {
+      position: relative;
+      padding-right: 12px;
+    }
+
     .routing-select-wrapper select {
       width: auto;
       min-width: 0;
@@ -3358,7 +3387,7 @@ INDEX_HTML = r"""<!doctype html>
       cursor: pointer;
       font-size: 13px;
       font-weight: 600;
-      padding: 0 18px 0 0;
+      padding: 0 22px 0 0;
       box-shadow: none;
       white-space: nowrap;
       text-overflow: ellipsis;
@@ -3373,11 +3402,11 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     #header_routing_country {
-      width: 92px;
+      width: auto;
     }
 
     #header_routing_ip_type {
-      width: 96px;
+      width: auto;
     }
 
     .protocol-filter-group {
@@ -4040,13 +4069,13 @@ INDEX_HTML = r"""<!doctype html>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
   <div class="btn-group">
-    <div class="routing-select-wrapper">
+    <div class="routing-select-wrapper has-select">
       <label for="header_routing_country" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">出站国家:</label>
       <select id="header_routing_country">
         <option value="">全部</option>
       </select>
     </div>
-    <div class="routing-select-wrapper">
+    <div class="routing-select-wrapper has-select">
       <label for="header_routing_ip_type" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">IP类型:</label>
       <select id="header_routing_ip_type">
         <option value="all">全部IP</option>
@@ -4162,14 +4191,18 @@ INDEX_HTML = r"""<!doctype html>
 
 
   <section class="toolbar">
-    <select id="country_filter">
-      <option value="">所有国家</option>
-    </select>
-    <select id="ip_type_filter">
-      <option value="">所有IP类型</option>
-      <option value="residential">住宅IP</option>
-      <option value="hosting">机房IP</option>
-    </select>
+    <span class="compact-select">
+      <select id="country_filter">
+        <option value="">所有国家</option>
+      </select>
+    </span>
+    <span class="compact-select">
+      <select id="ip_type_filter">
+        <option value="">所有IP类型</option>
+        <option value="residential">住宅IP</option>
+        <option value="hosting">机房IP</option>
+      </select>
+    </span>
     <div class="protocol-filter-group">
       <span class="protocol-filter-title">展示协议</span>
       <button type="button" id="list_protocol_tcp" class="protocol-toggle active" data-proto="tcp">TCP</button>
@@ -4555,6 +4588,40 @@ let sourceProbePending = new Set();
 let toastTimer = null;
 
 const $=id=>document.getElementById(id);
+
+function fitSelectToSelectedText(select) {
+  if (!select) return;
+  const option = select.options[select.selectedIndex];
+  const text = option ? option.textContent || "" : "";
+  const measurer = fitSelectToSelectedText.measurer || document.createElement("span");
+  if (!fitSelectToSelectedText.measurer) {
+    measurer.style.position = "fixed";
+    measurer.style.left = "-9999px";
+    measurer.style.top = "-9999px";
+    measurer.style.visibility = "hidden";
+    measurer.style.whiteSpace = "nowrap";
+    document.body.appendChild(measurer);
+    fitSelectToSelectedText.measurer = measurer;
+  }
+  const style = window.getComputedStyle(select);
+  measurer.style.fontFamily = style.fontFamily;
+  measurer.style.fontSize = style.fontSize;
+  measurer.style.fontWeight = style.fontWeight;
+  measurer.textContent = text || "全部";
+  const horizontalPadding = select.closest(".routing-select-wrapper") ? 24 : 52;
+  const minWidth = select.closest(".routing-select-wrapper") ? 34 : 96;
+  const maxWidth = select.closest(".routing-select-wrapper") ? 140 : 220;
+  select.style.width = `${Math.min(maxWidth, Math.max(minWidth, Math.ceil(measurer.offsetWidth) + horizontalPadding))}px`;
+}
+
+function refreshCompactSelectWidths() {
+  [
+    "header_routing_country",
+    "header_routing_ip_type",
+    "country_filter",
+    "ip_type_filter",
+  ].forEach(id => fitSelectToSelectedText($(id)));
+}
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
 const base=p=>(p||"").split(/[\\/]/).pop();
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
@@ -4758,6 +4825,7 @@ function updateCountryFilter() {
   } else {
     select.value = "";
   }
+  refreshCompactSelectWidths();
 }
 
 function normalizeProtoLabel(proto) {
@@ -5387,6 +5455,7 @@ function updateHeaderRoutingControls() {
   protocolUdp.checked = enabledProtocols.includes("udp");
   protocolTcp.parentElement.style.opacity = protocolTcp.checked ? "1" : "0.72";
   protocolUdp.parentElement.style.opacity = protocolUdp.checked ? "1" : "0.72";
+  refreshCompactSelectWidths();
 }
 
 async function saveHeaderRouting() {
@@ -5448,8 +5517,8 @@ async function load(){
 }
 
 $("search").oninput=()=>{ currentPage = 1; render(); };
-$("country_filter").onchange=()=>{ currentPage = 1; render(); };
-$("ip_type_filter").onchange=()=>{ currentPage = 1; updateCountryFilter(); render(); };
+$("country_filter").onchange=()=>{ currentPage = 1; refreshCompactSelectWidths(); render(); };
+$("ip_type_filter").onchange=()=>{ currentPage = 1; updateCountryFilter(); refreshCompactSelectWidths(); render(); };
 $("list_protocol_tcp").onclick = handleListProtocolFilterChange;
 $("list_protocol_udp").onclick = handleListProtocolFilterChange;
 $("header_routing_country").onchange = saveHeaderRouting;
