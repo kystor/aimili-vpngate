@@ -392,6 +392,52 @@ def log_to_json(level: str, module: str, message: str) -> None:
     except Exception as e:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
 
+def parse_log_timestamp(timestamp: str) -> datetime | None:
+    try:
+        return datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHANGHAI_TZ)
+    except Exception:
+        return None
+
+def read_recent_logs(logs_dir: Path, hours: int = 24) -> list[dict[str, Any]]:
+    now = datetime.now(SHANGHAI_TZ)
+    cutoff = now - timedelta(hours=hours)
+    start_date = cutoff.date()
+    entries: list[dict[str, Any]] = []
+
+    try:
+        log_files = sorted(logs_dir.glob("*.json"))
+    except Exception as e:
+        print(f"[日志读取错误] 无法列出日志文件: {e}", flush=True)
+        return entries
+
+    for log_file in log_files:
+        try:
+            file_date = datetime.strptime(log_file.stem, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if file_date < start_date:
+            continue
+
+        try:
+            with lock:
+                with open(log_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            log_time = parse_log_timestamp(str(entry.get("timestamp", "")))
+                            if log_time and log_time >= cutoff:
+                                entries.append(entry)
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"[日志读取错误] 读取日志文件失败 {log_file.name}: {e}", flush=True)
+
+    entries.sort(key=lambda item: item.get("timestamp", ""))
+    return entries
+
 def set_state(**updates: Any) -> None:
     state = get_state()
     state.update(updates)
@@ -4529,7 +4575,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-          今日运行日志
+          最近24小时运行日志
         </h3>
         
         <div style="display: flex; align-items: center; gap: 10px; margin-left: auto;">
@@ -4550,7 +4596,7 @@ INDEX_HTML = r"""<!doctype html>
       <!-- Terminal Log Container -->
       <div id="log_terminal_container" style="background: #050811; border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 10px; height: 400px; padding: 16px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; line-height: 1.5; text-align: left; white-space: pre-wrap; word-break: break-all; color: #a5b4fc; box-shadow: inset 0 4px 20px rgba(0,0,0,0.8); position: relative; margin-bottom: 20px;">
         <div style="color: var(--text-secondary); text-align: center; margin-top: 150px;">
-          暂无今日运行日志记录。
+          暂无最近24小时运行日志记录。
         </div>
       </div>
 
@@ -6415,7 +6461,7 @@ function filterAndRenderLogs(forceRender = false) {
 
 async function copyLogContent() {
   const text = getRenderedLogText();
-  if (!text || text.includes("暂无今日") || text.includes("暂无该类型")) {
+  if (!text || text.includes("暂无最近24小时") || text.includes("暂无该类型")) {
     showToast("当前没有可供复制的日志。", "error");
     return;
   }
@@ -6460,7 +6506,7 @@ async function copyLogContent() {
 
 function exportLogContent() {
   const text = getRenderedLogText();
-  if (!text || text.includes("暂无今日") || text.includes("暂无该类型")) {
+  if (!text || text.includes("暂无最近24小时") || text.includes("暂无该类型")) {
     showToast("当前没有可供导出的日志。", "error");
     return;
   }
@@ -6945,23 +6991,7 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif effective_path == "/api/logs":
             logs_dir = DATA_DIR / "logs"
-            date_str = time.strftime("%Y-%m-%d", time.localtime())
-            log_file = logs_dir / f"{date_str}.json"
-            entries = []
-            if log_file.exists():
-                try:
-                    with lock:
-                        with open(log_file, "r", encoding="utf-8") as f:
-                            for line in f:
-                                line = line.strip()
-                                if line:
-                                    try:
-                                        entries.append(json.loads(line))
-                                    except Exception:
-                                        pass
-                except Exception as e:
-                    print(f"[API Logs] Error reading log file: {e}", flush=True)
-            self.send_json({"logs": entries})
+            self.send_json({"logs": read_recent_logs(logs_dir, hours=24)})
         elif effective_path == "/api/sources":
             self.send_json({"ok": True, **source_pool_public_data()})
         else:
