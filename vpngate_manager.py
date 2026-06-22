@@ -1732,11 +1732,9 @@ def filter_nodes_for_routing(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any]
     if routing_mode == "fixed_region" and target_country:
         filtered = [node for node in filtered if node.get("country") == target_country]
 
-    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-    if routing_ip_type == "residential":
-        filtered = [node for node in filtered if node.get("ip_type") in ("residential", "mobile")]
-    elif routing_ip_type == "hosting":
-        filtered = [node for node in filtered if node.get("ip_type") == "hosting"]
+    routing_ip_type = str(ui_cfg.get("routing_ip_type") or "all").strip()
+    if routing_ip_type != "all":
+        filtered = [node for node in filtered if str(node.get("ip_type") or "").strip() == routing_ip_type]
 
     return apply_protocol_filter(filtered, ui_cfg.get("routing_protocol", ["udp"]))
 
@@ -4079,8 +4077,6 @@ INDEX_HTML = r"""<!doctype html>
       <label for="header_routing_ip_type" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">IP类型:</label>
       <select id="header_routing_ip_type">
         <option value="all">全部IP</option>
-        <option value="residential">仅静态住宅IP</option>
-        <option value="hosting">仅机房IP</option>
       </select>
     </div>
     <div class="routing-select-wrapper">
@@ -4199,8 +4195,6 @@ INDEX_HTML = r"""<!doctype html>
     <span class="compact-select">
       <select id="ip_type_filter">
         <option value="">所有IP类型</option>
-        <option value="residential">住宅IP</option>
-        <option value="hosting">机房IP</option>
       </select>
     </span>
     <div class="protocol-filter-group">
@@ -4674,7 +4668,16 @@ const translateQuality = q => {
 };
 
 const translateIpType = t => {
-  const dict = {"residential": "住宅 IP", "hosting": "机房 IP", "mobile": "住宅 IP", "proxy": "住宅 IP"};
+  const dict = {
+    "residential": "住宅 IP",
+    "hosting": "机房 IP",
+    "mobile": "移动 IP",
+    "proxy": "代理 IP",
+    "business": "商业 IP",
+    "education": "教育 IP",
+    "government": "政企 IP",
+    "unknown": "未知类型",
+  };
   return dict[t] || t || "-";
 };
 
@@ -4771,15 +4774,33 @@ function getCountryCountMap() {
   return countMap;
 }
 
+function getIpTypeCountMap(sourceNodes = nodes) {
+  const countMap = {};
+  sourceNodes.forEach(n => {
+    const type = String(n?.ip_type || "").trim();
+    if (type) {
+      countMap[type] = (countMap[type] || 0) + 1;
+    }
+  });
+  return countMap;
+}
+
+function getSortedIpTypes(sourceNodes = nodes) {
+  const preferredOrder = ["residential", "hosting"];
+  const countMap = getIpTypeCountMap(sourceNodes);
+  return Object.keys(countMap).sort((a, b) => {
+    const ai = preferredOrder.indexOf(a);
+    const bi = preferredOrder.indexOf(b);
+    if (ai !== -1 || bi !== -1) {
+      return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    }
+    return translateIpType(a).localeCompare(translateIpType(b), "zh-CN");
+  });
+}
+
 function matchesIpTypeFilter(node, selectedIpType) {
   if (!selectedIpType) return true;
-  if (selectedIpType === "residential") {
-    return ["residential", "mobile"].includes(node.ip_type);
-  }
-  if (selectedIpType === "hosting") {
-    return node.ip_type === "hosting";
-  }
-  return true;
+  return String(node?.ip_type || "").trim() === selectedIpType;
 }
 
 function matchesProtocolFilter(node, selectedProtocols) {
@@ -4792,6 +4813,23 @@ function getCountryFilterNodes() {
   const selectedIpType = $("ip_type_filter").value;
   const selectedProtocols = getListDisplayProtocols();
   return nodes.filter(n => n && matchesIpTypeFilter(n, selectedIpType) && matchesProtocolFilter(n, selectedProtocols));
+}
+
+function updateIpTypeFilter() {
+  const select = $("ip_type_filter");
+  if (!select) return;
+  const selectedValue = select.value;
+  const selectedProtocols = getListDisplayProtocols();
+  const sourceNodes = nodes.filter(n => n && matchesProtocolFilter(n, selectedProtocols));
+  const countMap = getIpTypeCountMap(sourceNodes);
+  const ipTypes = getSortedIpTypes(sourceNodes);
+  const selectedFallback = selectedValue && !ipTypes.includes(selectedValue)
+    ? `<option value="${esc(selectedValue)}">${esc(translateIpType(selectedValue))} (0)</option>`
+    : "";
+  select.innerHTML = '<option value="">所有IP类型</option>' + selectedFallback +
+    ipTypes.map(type => `<option value="${esc(type)}">${esc(translateIpType(type))} (${countMap[type]})</option>`).join("");
+  select.value = selectedValue || "";
+  refreshCompactSelectWidths();
 }
 
 function updateCountryFilter() {
@@ -4865,6 +4903,7 @@ async function syncNodes(options = {}) {
   state = data.state || {};
   stableSortNodes();
   if (updateFilters) {
+    updateIpTypeFilter();
     updateCountryFilter();
     updateHeaderRoutingControls();
   }
@@ -4891,6 +4930,7 @@ function handleListProtocolFilterChange(event) {
   }
   setProtocolToggleState(button, nextActive);
   currentPage = 1;
+  updateIpTypeFilter();
   updateCountryFilter();
   render();
 }
@@ -5448,8 +5488,18 @@ function updateHeaderRoutingControls() {
       fixedIpOpt.remove();
     }
   }
-  
-  selectIpType.value = state.routing_ip_type || "all";
+
+  const routingIpType = state.routing_ip_type || "all";
+  const ipTypes = getSortedIpTypes();
+  const routingFallback = routingIpType && routingIpType !== "all" && !ipTypes.includes(routingIpType)
+    ? `<option value="${esc(routingIpType)}">${esc(translateIpType(routingIpType))}（当前无节点）</option>`
+    : "";
+  const ipTypeOptions = '<option value="all">全部IP</option>' + routingFallback +
+    ipTypes.map(type => `<option value="${esc(type)}">${esc(translateIpType(type))}</option>`).join("");
+  if (selectIpType.innerHTML !== ipTypeOptions) {
+    selectIpType.innerHTML = ipTypeOptions;
+  }
+  selectIpType.value = routingIpType;
   const enabledProtocols = Array.isArray(state.routing_protocol) ? state.routing_protocol : [];
   protocolTcp.checked = enabledProtocols.includes("tcp");
   protocolUdp.checked = enabledProtocols.includes("udp");
@@ -7168,14 +7218,20 @@ class Handler(BaseHTTPRequestHandler):
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
-                if routing_ip_type not in ("all", "residential", "hosting"):
+                ui_cfg = load_ui_config()
+                available_ip_types = {
+                    str(node.get("ip_type") or "").strip()
+                    for node in read_json(NODES_FILE, [])
+                    if str(node.get("ip_type") or "").strip()
+                }
+                current_ip_type = str(ui_cfg.get("routing_ip_type") or "").strip()
+                if routing_ip_type != "all" and routing_ip_type not in available_ip_types and routing_ip_type != current_ip_type:
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
                     return
                 if not routing_protocol:
                     self.send_json({"ok": False, "error": "请至少保留一种协议"}, HTTPStatus.BAD_REQUEST)
                     return
                 
-                ui_cfg = load_ui_config()
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
