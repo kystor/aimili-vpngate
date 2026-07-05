@@ -288,6 +288,8 @@ else
 fi
 
 echo -e "  -> 正在写入服务环境文件 /etc/default/aimilivpn ..."
+# 提前创建目录，避免 Alpine 或精简系统缺少 /etc/default 导致写入失败
+mkdir -p /etc/default
 cat > /etc/default/aimilivpn <<EOF
 # AimiliVPN 服务默认环境变量
 VPNGATE_DATA_DIR=${INSTALL_DIR}/vpngate_data
