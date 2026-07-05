@@ -107,6 +107,93 @@ elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
     $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
 fi
 
+log_openvpn_env_check() {
+    local level="$1"
+    local message="$2"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    mkdir -p "${INSTALL_DIR}/vpngate_data" 2>/dev/null || true
+    echo -e "  -> ${message}"
+    printf '[%s] [Install] [%s] %s\n' "$ts" "$level" "$message" >> "${INSTALL_DIR}/vpngate_data/install_env_check.log" 2>/dev/null || true
+    printf '[%s] [Install] [%s] %s\n' "$ts" "$level" "$message" >> "${INSTALL_DIR}/vpngate_data/vpngate.log" 2>/dev/null || true
+}
+
+run_openvpn_runtime_precheck() {
+    local issues=0
+    local warnings=0
+    local openvpn_path=""
+    local virt_type=""
+
+    echo -e "\n${YELLOW}正在进行 OpenVPN 运行环境预检...${PLAIN}"
+    log_openvpn_env_check "INFO" "开始检查 OpenVPN 运行环境。"
+
+    if command -v openvpn >/dev/null 2>&1; then
+        openvpn_path=$(command -v openvpn)
+        log_openvpn_env_check "INFO" "OpenVPN 命令可用: ${openvpn_path}"
+        if openvpn --version >/dev/null 2>&1; then
+            log_openvpn_env_check "INFO" "OpenVPN 版本检测正常。"
+        else
+            issues=$((issues + 1))
+            log_openvpn_env_check "ERROR" "OpenVPN 命令存在，但无法正常输出版本信息，请检查安装包是否损坏。"
+        fi
+    else
+        issues=$((issues + 1))
+        log_openvpn_env_check "ERROR" "未找到 openvpn 命令，节点测试和连接一定会失败，请确认 openvpn 已安装并在 PATH 中。"
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        log_openvpn_env_check "INFO" "iproute2 命令可用。"
+        if ip route show default >/dev/null 2>&1 && [ -n "$(ip route show default 2>/dev/null | head -n 1)" ]; then
+            log_openvpn_env_check "INFO" "系统默认路由存在。"
+        else
+            warnings=$((warnings + 1))
+            log_openvpn_env_check "WARNING" "未检测到默认路由，VPS 可能无法访问外部 VPN 节点。"
+        fi
+    else
+        issues=$((issues + 1))
+        log_openvpn_env_check "ERROR" "未找到 ip 命令，无法配置策略路由，请安装 iproute2/iproute。"
+    fi
+
+    if command -v iptables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1; then
+        log_openvpn_env_check "INFO" "检测到防火墙管理工具。"
+    else
+        warnings=$((warnings + 1))
+        log_openvpn_env_check "WARNING" "未检测到 iptables 或 nft，后续代理转发/防火墙诊断能力可能受限。"
+    fi
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt_type=$(systemd-detect-virt -c 2>/dev/null || true)
+    fi
+    if [ -z "$virt_type" ] && [ -f /.dockerenv ]; then
+        virt_type="docker"
+    fi
+    if [ -n "$virt_type" ] && [ "$virt_type" != "none" ]; then
+        warnings=$((warnings + 1))
+        log_openvpn_env_check "WARNING" "检测到当前可能是容器环境: ${virt_type}。如果缺少 TUN，需要在宿主机或服务商面板开启 TUN/TAP。"
+    fi
+
+    if [ ! -e /dev/net/tun ]; then
+        issues=$((issues + 1))
+        log_openvpn_env_check "ERROR" "缺少 /dev/net/tun，OpenVPN 无法创建虚拟网卡，所有节点都会连接失败；请在 VPS 面板开启 TUN/TAP 或更换支持 TUN 的 KVM VPS。"
+    elif [ ! -c /dev/net/tun ]; then
+        issues=$((issues + 1))
+        log_openvpn_env_check "ERROR" "/dev/net/tun 存在但不是字符设备，OpenVPN 无法使用，请检查 VPS/容器设备映射。"
+    elif [ ! -r /dev/net/tun ] || [ ! -w /dev/net/tun ]; then
+        issues=$((issues + 1))
+        log_openvpn_env_check "ERROR" "/dev/net/tun 权限不足，OpenVPN 无法读写 TUN 设备，请检查设备权限或容器授权。"
+    else
+        log_openvpn_env_check "INFO" "TUN 设备可用: /dev/net/tun"
+    fi
+
+    if [ "$issues" -gt 0 ]; then
+        log_openvpn_env_check "ERROR" "OpenVPN 运行环境预检发现 ${issues} 个严重问题、${warnings} 个提示项；安装会继续，但节点连接可能无法成功。"
+        echo -e "${YELLOW}  -> 预检日志: ${INSTALL_DIR}/vpngate_data/install_env_check.log${PLAIN}"
+    else
+        log_openvpn_env_check "INFO" "OpenVPN 运行环境预检通过，发现 ${warnings} 个提示项。"
+        echo -e "${GREEN}  -> OpenVPN 运行环境预检完成。${PLAIN}"
+    fi
+}
+
 # 4. Clone or pull the repository
 # 默认部署分支（在 bate 分支设为 bate；在 main 分支设为 main）
 DEFAULT_DEPLOY_BRANCH="main"
@@ -201,8 +288,6 @@ else
 fi
 
 echo -e "  -> 正在写入服务环境文件 /etc/default/aimilivpn ..."
-# 【优化】：提前创建目录，彻底解决 Alpine 下 No such file or directory 的报错
-mkdir -p /etc/default
 cat > /etc/default/aimilivpn <<EOF
 # AimiliVPN 服务默认环境变量
 VPNGATE_DATA_DIR=${INSTALL_DIR}/vpngate_data
@@ -1317,6 +1402,8 @@ if [ -d "/proc/sys/net/ipv4/conf" ]; then
         sysctl -w net.ipv4.conf.${dev_name}.rp_filter=2 >/dev/null 2>&1 || true
     done
 fi
+
+run_openvpn_runtime_precheck
 
 echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
 if command -v systemctl >/dev/null 2>&1; then
