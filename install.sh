@@ -54,6 +54,19 @@ echo -e "${BLUE}==========================================================${PLAI
 DEFAULT_USER="kystor"
 DEFAULT_REPO="aimili-vpngate"
 INSTALL_DIR="/opt/aimilivpn"
+SERVICE_MANAGER="none"
+
+is_systemd_available() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    [ -d /run/systemd/system ] || return 1
+    systemctl list-units --type=service --no-pager >/dev/null 2>&1
+}
+
+is_openrc_available() {
+    command -v rc-service >/dev/null 2>&1 || return 1
+    command -v rc-update >/dev/null 2>&1 || return 1
+    [ -d /run/openrc ] || return 1
+}
 
 parse_github_repo_from_url() {
     local remote_url="$1"
@@ -244,8 +257,9 @@ fi
 
 # 5. Configure Service
 echo -e "\n${YELLOW}[3/4] 正在配置系统服务...${PLAIN}"
-if command -v systemctl >/dev/null 2>&1; then
-    echo -e "  -> 检测到 systemd，正在创建服务配置 /lib/systemd/system/aimilivpn.service ..."
+if is_systemd_available; then
+    SERVICE_MANAGER="systemd"
+    echo -e "  -> 检测到可用的 systemd，正在创建服务配置 /lib/systemd/system/aimilivpn.service ..."
     cat > /lib/systemd/system/aimilivpn.service <<EOF
 [Unit]
 Description=AimiliVPN OpenVPN Manager with HTTP/SOCKS5 Proxy
@@ -264,8 +278,9 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable aimilivpn.service
-elif command -v rc-service >/dev/null 2>&1; then
-    echo -e "  -> 检测到 OpenRC，正在创建服务配置 /etc/init.d/aimilivpn ..."
+elif is_openrc_available; then
+    SERVICE_MANAGER="openrc"
+    echo -e "  -> 检测到可用的 OpenRC，正在创建服务配置 /etc/init.d/aimilivpn ..."
     cat > /etc/init.d/aimilivpn <<EOF
 #!/sbin/openrc-run
 
@@ -284,7 +299,9 @@ EOF
     chmod +x /etc/init.d/aimilivpn
     rc-update add aimilivpn default
 else
-    echo -e "${YELLOW}警告: 未能检测到 systemd 或 OpenRC，请手动管理服务。${PLAIN}"
+    SERVICE_MANAGER="none"
+    echo -e "${YELLOW}提示: 当前环境未运行 systemd/OpenRC，已跳过系统服务配置。${PLAIN}"
+    echo -e "${YELLOW}      如果这是容器、WSL 或面板终端环境，请用 python3 ${INSTALL_DIR}/vpngate_manager.py 手动启动。${PLAIN}"
 fi
 
 echo -e "  -> 正在写入服务环境文件 /etc/default/aimilivpn ..."
@@ -313,6 +330,20 @@ import shutil
 
 INSTALL_DIR = "/opt/aimilivpn"
 LOG_FILE = "/opt/aimilivpn/vpngate_data/vpngate.log"
+
+def systemd_available():
+    if not shutil.which("systemctl") or not os.path.isdir("/run/systemd/system"):
+        return False
+    result = subprocess.run(
+        ["systemctl", "list-units", "--type=service", "--no-pager"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+def openrc_available():
+    return bool(shutil.which("rc-service") and shutil.which("rc-update") and os.path.isdir("/run/openrc"))
 
 def generate_random_password():
     import random
@@ -734,12 +765,13 @@ def print_status():
     print_line("=======================================================")
 
 def run_service_cmd(cmd):
-    if shutil.which("systemctl"):
+    if systemd_available():
         subprocess.run(["systemctl", cmd, "aimilivpn.service"])
-    elif shutil.which("rc-service"):
+    elif openrc_available():
         subprocess.run(["rc-service", "aimilivpn", cmd])
     else:
-        print("未检测到支持的服务管理器 (systemd/OpenRC)")
+        print("当前环境未运行 systemd/OpenRC，无法通过系统服务管理 AimiliVPN。")
+        print(f"请手动运行: python3 {INSTALL_DIR}/vpngate_manager.py")
 
 def start_service():
     print("正在启动 AimiliVPN 服务...", flush=True)
@@ -849,16 +881,20 @@ def uninstall_service():
         print(f"正在完全卸载 AimiliVPN...", flush=True)
         print(f"安装目录就是: {INSTALL_DIR}", flush=True)
         stop_service()
-        if shutil.which("systemctl"):
+        if systemd_available():
             subprocess.run(["systemctl", "disable", "--now", "aimilivpn.service"], check=False)
             subprocess.run(["systemctl", "stop", "aimilivpn.service"], check=False)
             remove_path("/lib/systemd/system/aimilivpn.service")
             remove_path("/etc/systemd/system/aimilivpn.service")
             subprocess.run(["systemctl", "daemon-reload"], check=False)
             subprocess.run(["systemctl", "reset-failed", "aimilivpn.service"], check=False)
-        elif shutil.which("rc-service"):
+        elif openrc_available():
             subprocess.run(["rc-service", "aimilivpn", "stop"], check=False)
             subprocess.run(["rc-update", "del", "aimilivpn"], check=False)
+            remove_path("/etc/init.d/aimilivpn")
+        else:
+            remove_path("/lib/systemd/system/aimilivpn.service")
+            remove_path("/etc/systemd/system/aimilivpn.service")
             remove_path("/etc/init.d/aimilivpn")
         subprocess.run(["pkill", "-f", "openvpn.*tun0"], check=False)
         subprocess.run(["pkill", "-f", "openvpn.*vpngate_data"], check=False)
@@ -1408,45 +1444,53 @@ fi
 run_openvpn_runtime_precheck
 
 echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
-if command -v systemctl >/dev/null 2>&1; then
+SERVICE_STARTED="no"
+if [ "$SERVICE_MANAGER" = "systemd" ]; then
     systemctl restart aimilivpn.service || true
-elif command -v rc-service >/dev/null 2>&1; then
+    SERVICE_STARTED="yes"
+elif [ "$SERVICE_MANAGER" = "openrc" ]; then
     rc-service aimilivpn restart || true
+    SERVICE_STARTED="yes"
+else
+    echo -e "  -> ${YELLOW}当前环境没有可用的 systemd/OpenRC，已跳过自动启动。${PLAIN}"
+    echo -e "  -> ${YELLOW}请手动执行: python3 ${INSTALL_DIR}/vpngate_manager.py${PLAIN}"
 fi
 
 # Wait and poll for node loading and active connection
-echo -e "\n正在等待 AimiliVPN 首次获取节点并建立加密通道 (此过程可能需要 5-30 秒)..."
 ACTIVE_ID=""
 LAST_MSG=""
-for i in {1..90}; do
-    if [ -f "${INSTALL_DIR}/vpngate_data/state.json" ]; then
-        ACTIVE_ID=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('active_openvpn_node_id', ''))" 2>/dev/null || echo "")
-        IS_CONN=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('is_connecting', False))" 2>/dev/null || echo "False")
-        CUR_MSG=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('last_check_message', ''))" 2>/dev/null || echo "")
-        
-        if [ "$IS_CONN" = "False" ] || [ "$IS_CONN" = "false" ]; then
-            if [ -n "$ACTIVE_ID" ]; then
-                echo -e "  -> ${GREEN}[已就绪]${PLAIN} 首次节点连接成功，活动节点: ${GREEN}$ACTIVE_ID${PLAIN}"
-                break
+if [ "$SERVICE_STARTED" = "yes" ]; then
+    echo -e "\n正在等待 AimiliVPN 首次获取节点并建立加密通道 (此过程可能需要 5-30 秒)..."
+    for i in {1..90}; do
+        if [ -f "${INSTALL_DIR}/vpngate_data/state.json" ]; then
+            ACTIVE_ID=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('active_openvpn_node_id', ''))" 2>/dev/null || echo "")
+            IS_CONN=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('is_connecting', False))" 2>/dev/null || echo "False")
+            CUR_MSG=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('last_check_message', ''))" 2>/dev/null || echo "")
+
+            if [ "$IS_CONN" = "False" ] || [ "$IS_CONN" = "false" ]; then
+                if [ -n "$ACTIVE_ID" ]; then
+                    echo -e "  -> ${GREEN}[已就绪]${PLAIN} 首次节点连接成功，活动节点: ${GREEN}$ACTIVE_ID${PLAIN}"
+                    break
+                else
+                    if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
+                        echo -e "  -> 提示: ${YELLOW}${CUR_MSG}${PLAIN}"
+                        LAST_MSG="$CUR_MSG"
+                    fi
+                fi
             else
                 if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
-                    echo -e "  -> 提示: ${YELLOW}${CUR_MSG}${PLAIN}"
+                    echo -e "  -> 状态: ${YELLOW}${CUR_MSG}${PLAIN}"
                     LAST_MSG="$CUR_MSG"
                 fi
             fi
         else
-            if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
-                echo -e "  -> 状态: ${YELLOW}${CUR_MSG}${PLAIN}"
-                LAST_MSG="$CUR_MSG"
-            fi
+            echo -n "."
         fi
-    else
-        echo -n "."
+        sleep 1
+    done
+    if [ -z "$ACTIVE_ID" ]; then
+        echo -e "  -> ${YELLOW}[加载超时]${PLAIN} 首次节点获取或连接超时，将在后台继续尝试..."
     fi
-    sleep 1
-done
-if [ -z "$ACTIVE_ID" ]; then
-    echo -e "  -> ${YELLOW}[加载超时]${PLAIN} 首次节点获取或连接超时，将在后台继续尝试..."
 fi
 
 SECRET_PATH="EJsW2EeBo9lY"
@@ -1488,6 +1532,10 @@ if [ -n "$PUBLIC_IPV6" ]; then
 fi
 echo -e "  * 本机调试入口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${PLAIN}  或  ${BLUE}http://[::1]:${PROXY_PORT}/${PLAIN}"
 echo -e "  * 安装目录:  ${YELLOW}${INSTALL_DIR}${PLAIN}"
+if [ "$SERVICE_MANAGER" = "none" ]; then
+    echo -e "  * 服务状态:  ${YELLOW}当前环境未运行 systemd/OpenRC，未自动启动后台服务。${PLAIN}"
+    echo -e "  * 手动启动:  ${YELLOW}cd ${INSTALL_DIR} && python3 vpngate_manager.py${PLAIN}"
+fi
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
